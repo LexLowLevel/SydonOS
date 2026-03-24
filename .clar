@@ -1,0 +1,2 @@
+5990379511544261825 ./kernel/cpus.clar
+6687165449070716490 ./kernel/main.clar
