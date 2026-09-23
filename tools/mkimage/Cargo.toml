@@ -1,0 +1,8 @@
+[package]
+name = "mkimage"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "mkimage"
+path = "src/main.rs"
