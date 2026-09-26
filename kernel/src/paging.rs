@@ -1,7 +1,9 @@
 use crate::cpu;
 use crate::frame;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 pub const KERNEL_OFFSET: u64 = 0xFFFF_FFFF_8000_0000;
+pub const PHYSMAP: u64 = 0xFFFF_8000_0000_0000;
 pub const LAPIC_VIRT: u64 = 0xFFFF_FFFF_4000_0000;
 const LAPIC_PHYS: u64 = 0xFEE0_0000;
 
@@ -10,15 +12,31 @@ pub const HUGE: u64 = 0x20_0000;
 pub const PRESENT: u64 = 1;
 pub const WRITABLE: u64 = 2;
 pub const USER: u64 = 4;
+pub const NO_CACHE: u64 = 0x18;
 const HUGE_PAGE: u64 = 0x80;
 
 const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
-const PHYS_LIMIT: u64 = 0x8000_0000;
 const SCRATCH_VA: u64 = 0x0000_0080_0000_0000;
+const LOW_4G: u64 = 0x1_0000_0000;
+
+// stage1 identity-maps the low 2 GiB, which is all we touch before the switch
+static PHYS_OFFSET: AtomicU64 = AtomicU64::new(0);
+
+extern "C" {
+    static _kernel_start: u8;
+    static _kernel_end: u8;
+}
 
 #[inline]
 pub fn phys_to_virt(p: u64) -> u64 {
-    p.wrapping_add(KERNEL_OFFSET)
+    p.wrapping_add(PHYS_OFFSET.load(Ordering::Relaxed))
+}
+
+pub fn image_bounds() -> (u64, u64) {
+    (
+        core::ptr::addr_of!(_kernel_start) as u64,
+        core::ptr::addr_of!(_kernel_end) as u64,
+    )
 }
 
 const fn pml4i(v: u64) -> usize {
@@ -46,6 +64,7 @@ unsafe fn get_or_create(parent: u64, idx: usize) -> u64 {
     let e = p.read_volatile();
     if e & PRESENT == 0 {
         let f = frame::alloc_zeroed().expect("paging: out of frames");
+        // upper levels allow everything, the leaf entry decides
         p.write_volatile(f | PRESENT | WRITABLE | USER);
         f
     } else {
@@ -114,26 +133,114 @@ pub fn translate(pml4: u64, virt: u64) -> Option<u64> {
     }
 }
 
-// kernel half: physmap 0..2GB at KERNEL_OFFSET plus a dedicated LAPIC window
-pub fn build_kernel_space() -> u64 {
+// kernel half: physmap of the low 4 GiB and all ram, the kernel image
+// backed by image_phys, and the lapic window
+pub fn build_kernel_space(image_phys: u64) -> u64 {
     let pml4 = frame::alloc_zeroed().expect("paging: no pml4");
+    let (start, end) = image_bounds();
     unsafe {
         let mut p = 0u64;
-        while p < PHYS_LIMIT {
-            map_2m(pml4, phys_to_virt(p), p, WRITABLE);
+        while p < frame::phys_top().max(LOW_4G) {
+            map_2m(pml4, PHYSMAP + p, p, WRITABLE);
             p += HUGE;
         }
-        map_4k(pml4, LAPIC_VIRT, LAPIC_PHYS, WRITABLE);
+        let mut v = start & !0xFFF;
+        while v < end {
+            map_4k(pml4, v, image_phys + (v - start), WRITABLE);
+            v += 0x1000;
+        }
+        map_4k(pml4, LAPIC_VIRT, LAPIC_PHYS, WRITABLE | NO_CACHE);
     }
     pml4
+}
+
+pub fn init() -> u64 {
+    let pml4 = build_kernel_space(image_bounds().0 - KERNEL_OFFSET);
+    activate(pml4);
+    use_physmap();
+    pml4
+}
+
+pub fn use_physmap() {
+    PHYS_OFFSET.store(PHYSMAP, Ordering::Relaxed);
+}
+
+pub fn user_range_ok(pml4: u64, va: u64, len: u64) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let Some(end) = va.checked_add(len) else {
+        return false;
+    };
+    if end > 0x0000_8000_0000_0000 {
+        return false;
+    }
+    let mut page = va & !0xFFF;
+    while page < end {
+        if leaf(pml4, page).is_none_or(|e| e & USER == 0) {
+            return false;
+        }
+        page += 0x1000;
+    }
+    true
+}
+
+fn leaf(pml4: u64, virt: u64) -> Option<u64> {
+    unsafe {
+        let mut table = pml4;
+        for idx in [pml4i(virt), pdpti(virt), pdi(virt)] {
+            let e = entry(table, idx).read_volatile();
+            if e & PRESENT == 0 {
+                return None;
+            }
+            if e & HUGE_PAGE != 0 {
+                return Some(e);
+            }
+            table = e & ADDR_MASK;
+        }
+        let e = entry(table, pti(virt)).read_volatile();
+        (e & PRESENT != 0).then_some(e)
+    }
+}
+
+// frees every page and table in the lower half, then the pml4 itself.
+// the upper half belongs to the kernel and is only borrowed.
+pub fn free_user_space(pml4: u64) {
+    unsafe fn free_level(table: u64, level: u32) {
+        for i in 0..512 {
+            let e = entry(table, i).read_volatile();
+            if e & PRESENT == 0 {
+                continue;
+            }
+            let next = e & ADDR_MASK;
+            if level > 1 && e & HUGE_PAGE == 0 {
+                free_level(next, level - 1);
+            }
+            frame::free(next, 1);
+        }
+    }
+    unsafe {
+        for i in 0..256 {
+            let e = entry(pml4, i).read_volatile();
+            if e & PRESENT != 0 {
+                free_level(e & ADDR_MASK, 3);
+                frame::free(e & ADDR_MASK, 1);
+            }
+        }
+    }
+    frame::free(pml4, 1);
 }
 
 pub fn activate(pml4: u64) {
     cpu::write_cr3(pml4);
 }
 
+pub fn current() -> u64 {
+    cpu::read_cr3() & ADDR_MASK
+}
+
 pub fn self_test() {
-    let pml4 = cpu::read_cr3() & ADDR_MASK;
+    let pml4 = current();
     let f = frame::alloc_zeroed().expect("paging: self-test frame");
     unsafe {
         map_4k(pml4, SCRATCH_VA, f, WRITABLE);

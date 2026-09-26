@@ -23,25 +23,9 @@ pub fn inb(port: u16) -> u8 {
 }
 
 #[inline]
-pub fn outl(port: u16, val: u32) {
-    unsafe {
-        asm!("out dx, eax", in("dx") port, in("eax") val, options(nomem, nostack, preserves_flags))
-    }
-}
-
-#[inline]
-pub fn inl(port: u16) -> u32 {
-    let val: u32;
-    unsafe {
-        asm!("in eax, dx", out("eax") val, in("dx") port, options(nomem, nostack, preserves_flags))
-    }
-    val
-}
-
-#[inline]
 pub fn hlt() {
     unsafe {
-        asm!("hlt", options(nomem, nostack, preserves_flags))
+        asm!("hlt", options(nostack, preserves_flags))
     }
 }
 
@@ -54,17 +38,18 @@ pub fn hlt_loop() -> ! {
 #[inline]
 pub fn cli() {
     unsafe {
-        asm!("cli", options(nomem, nostack, preserves_flags))
+        asm!("cli", options(nostack, preserves_flags))
     }
 }
 
 #[inline]
 pub fn sti() {
     unsafe {
-        asm!("sti", options(nomem, nostack, preserves_flags))
+        asm!("sti", options(nostack, preserves_flags))
     }
 }
 
+// returns the old flags so nested critical sections restore the right IF
 #[inline]
 pub fn push_cli() -> u64 {
     let flags: u64;
@@ -79,6 +64,16 @@ pub fn pop_flags(flags: u64) {
     unsafe {
         asm!("push {}", "popfq", in(reg) flags)
     }
+}
+
+#[inline]
+pub fn rdtsc() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe {
+        asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack, preserves_flags))
+    }
+    ((hi as u64) << 32) | lo as u64
 }
 
 #[inline]
@@ -130,10 +125,6 @@ pub fn wrmsr(msr: u32, val: u64) {
     unsafe {
         asm!("wrmsr", in("ecx") msr, in("eax") low, in("edx") high, options(nomem, nostack, preserves_flags))
     }
-}
-
-pub unsafe fn lgdt(desc: &DescriptorTablePointer) {
-    asm!("lgdt [{}]", in(reg) desc, options(readonly, nostack, preserves_flags))
 }
 
 pub unsafe fn lidt(desc: &DescriptorTablePointer) {

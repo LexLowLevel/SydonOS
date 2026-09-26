@@ -14,7 +14,7 @@ global_asm!(
     ".section .text._start",
     ".global _start",
     "_start:",
-    "and rsp, -16",
+    "and rsp, -16", // SysV wants a 16-byte aligned stack at the call
     "call {main}",
     "ud2",
     main = sym job_main,

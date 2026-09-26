@@ -3,23 +3,31 @@
 
 extern crate alloc;
 
-mod bootinfo;
-mod cpu;
-mod frame;
-mod heap;
-mod sync;
 #[macro_use]
 mod serial;
+mod acpi;
 mod apic;
+mod bootinfo;
+mod cpu;
+mod elf;
+mod fabric;
+mod frame;
 mod gdt;
+mod heap;
 mod idt;
 mod paging;
+mod pit;
+mod ringtest;
+mod smp;
+mod sync;
 mod task;
 mod user;
 
 use bootinfo::BootInfo;
 use core::arch::global_asm;
 use core::panic::PanicInfo;
+
+const TICK_US: u64 = 10_000;
 
 static JOB_HELLO: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -49,8 +57,9 @@ extern "C" fn kernel_main(boot_info: *const BootInfo) -> ! {
 
     let bi = unsafe { &*boot_info };
     assert!(bi.magic == bootinfo::MAGIC, "bootinfo: bad magic");
+    let (elf_phys, elf_size) = (bi.kernel_elf_addr, bi.kernel_elf_size as usize);
 
-    gdt::init(unsafe { core::ptr::addr_of!(__stack_top) } as u64);
+    gdt::init(core::ptr::addr_of!(__stack_top) as u64);
     idt::init();
     println!("gdt + tss + idt ready");
 
@@ -59,20 +68,37 @@ extern "C" fn kernel_main(boot_info: *const BootInfo) -> ! {
     frame::init(bi);
     println!("frames: {} KiB free", frame::total_free() * 4);
 
-    let pml4 = paging::build_kernel_space();
-    paging::activate(pml4);
+    let pml4 = paging::init();
+    task::init(pml4);
     println!("paging: high-half kernel, tables at {:#x}", pml4);
     paging::self_test();
     println!("paging: map/unmap self-test ok");
 
-    heap::init();
-    println!("heap: 8 MiB ready");
+    apic::enable();
+    let timer_count = apic::calibrate(TICK_US);
+    println!("apic: {} timer counts per {} us", timer_count, TICK_US);
 
-    apic::init(500_000);
+    let cpus = acpi::cpus();
+    println!("acpi: {} cpus, bsp apic {}", cpus.count, apic::id());
+    smp::share_console();
+    let kernel_elf =
+        unsafe { core::slice::from_raw_parts(paging::phys_to_virt(elf_phys) as *const u8, elf_size) };
+    let online = smp::start_aps(&cpus, kernel_elf, timer_count);
+    println!("smp: {} of {} application processors online", online, cpus.count - 1);
+
+    let heap = heap::init();
+    println!("heap: {} KiB ready, {} KiB free", heap >> 10, frame::total_free() * 4);
+
+    apic::start_timer(timer_count);
     println!("apic: periodic timer at vector 32");
+    run_jobs()
+}
 
-    println!("user: loading hello.elf ({} bytes)", JOB_HELLO.len());
-    user::spawn(JOB_HELLO);
+pub fn run_jobs() -> ! {
+    if !user::spawn(JOB_HELLO) {
+        println!("cpu {}: could not start hello", smp::core());
+    }
+    ringtest::spawn();
     cpu::sti();
     task::schedule();
 
@@ -80,8 +106,7 @@ extern "C" fn kernel_main(boot_info: *const BootInfo) -> ! {
     loop {
         if !reported && task::all_done() {
             reported = true;
-            println!("all tasks done after {} ticks", task::ticks());
-            println!("boot complete");
+            println!("cpu {}: all tasks done after {} ticks", smp::core(), task::ticks());
         }
         cpu::sti();
         cpu::hlt();

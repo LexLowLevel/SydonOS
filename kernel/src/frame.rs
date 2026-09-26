@@ -1,10 +1,9 @@
 use crate::bootinfo::BootInfo;
-use crate::paging::{phys_to_virt, KERNEL_OFFSET};
+use crate::paging::{self, phys_to_virt, KERNEL_OFFSET};
 use crate::sync::SpinLock;
 
 pub const FRAME: u64 = 4096;
 const LOW_WATER: u64 = 0x10_0000;
-const PHYS_CAP: u64 = 0x8000_0000;
 const MAX_RANGES: usize = 64;
 
 #[derive(Clone, Copy)]
@@ -17,6 +16,8 @@ struct FrameAlloc {
     ranges: [Range; MAX_RANGES],
     n: usize,
     total: u64,
+    top: u64,
+    single: u64,
 }
 
 impl FrameAlloc {
@@ -25,6 +26,8 @@ impl FrameAlloc {
             ranges: [Range { base: 0, frames: 0 }; MAX_RANGES],
             n: 0,
             total: 0,
+            top: 0,
+            single: 0,
         }
     }
 
@@ -38,6 +41,12 @@ impl FrameAlloc {
     }
 
     fn alloc_contiguous(&mut self, n: u64) -> Option<u64> {
+        if n == 1 && self.single != 0 {
+            let f = self.single;
+            self.single = unsafe { (phys_to_virt(f) as *const u64).read() };
+            self.total -= 1;
+            return Some(f);
+        }
         for i in 0..self.n {
             if self.ranges[i].frames >= n {
                 let base = self.ranges[i].base;
@@ -54,33 +63,37 @@ impl FrameAlloc {
         None
     }
 
+    // single frames go on a stack linked through the frames themselves.
+    // bigger blocks become their own range and are never merged.
     fn free(&mut self, base: u64, frames: u64) {
-        self.insert(base, frames);
+        if frames == 1 {
+            unsafe { (phys_to_virt(base) as *mut u64).write(self.single) };
+            self.single = base;
+            self.total += 1;
+        } else {
+            self.insert(base, frames);
+        }
     }
 }
 
 static FRAMES: SpinLock<FrameAlloc> = SpinLock::new(FrameAlloc::new());
 
-extern "C" {
-    static _kernel_start: u8;
-    static _kernel_end: u8;
-}
-
 pub fn init(bi: &BootInfo) {
-    let k0 = (unsafe { core::ptr::addr_of!(_kernel_start) } as u64 - KERNEL_OFFSET) & !(FRAME - 1);
-    let k1 = (unsafe { core::ptr::addr_of!(_kernel_end) } as u64 - KERNEL_OFFSET + FRAME - 1)
-        & !(FRAME - 1);
+    let (start, end) = paging::image_bounds();
+    let k0 = (start - KERNEL_OFFSET) & !(FRAME - 1);
+    let k1 = (end - KERNEL_OFFSET + FRAME - 1) & !(FRAME - 1);
     let mut f = FRAMES.lock();
     for e in &bi.e820[..bi.e820_count as usize] {
         if e.kind != 1 {
             continue;
         }
         let start = (e.base + FRAME - 1) & !(FRAME - 1);
-        let end = ((e.base + e.len) & !(FRAME - 1)).min(PHYS_CAP);
+        let end = (e.base + e.len) & !(FRAME - 1);
         let start = start.max(LOW_WATER);
         if end <= start {
             continue;
         }
+        f.top = f.top.max(end);
         // skip the kernel image if it overlaps this range
         if k1 > start && k0 < end {
             if k0 > start {
@@ -93,6 +106,12 @@ pub fn init(bi: &BootInfo) {
             f.insert(start, (end - start) / FRAME);
         }
     }
+}
+
+pub fn init_region(base: u64, frames: u64) {
+    let mut f = FRAMES.lock();
+    f.insert(base, frames);
+    f.top = base + frames * FRAME;
 }
 
 pub fn alloc() -> Option<u64> {
@@ -113,6 +132,10 @@ pub fn alloc_contiguous(n: u64) -> Option<u64> {
 
 pub fn free(base: u64, frames: u64) {
     FRAMES.lock().free(base, frames);
+}
+
+pub fn phys_top() -> u64 {
+    FRAMES.lock().top
 }
 
 pub fn total_free() -> u64 {

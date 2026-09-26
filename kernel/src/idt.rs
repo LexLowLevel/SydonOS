@@ -28,6 +28,8 @@ pub struct Frame {
     pub ss: u64,
 }
 
+// stubs push a fake error code when the cpu has none, then the vector,
+// so isr_common always builds the same Frame
 global_asm!(
     ".macro ISR_NOERR n",
     ".global isr\\n",
@@ -58,6 +60,7 @@ global_asm!(
     "ISR_NOERR 32",
     "ISR_NOERR 255",
     "ISR_NOERR 128",
+    "ISR_NOERR 64",
     ".global isr_common",
     "isr_common:",
     "push rax",
@@ -108,12 +111,13 @@ global_asm!(
     ".quad isr32",
     ".quad isr255",
     ".quad isr128",
+    ".quad isr64",
     ".text",
     dispatch = sym interrupt_dispatch,
 );
 
 extern "C" {
-    static isr_stub_table: [u64; 35];
+    static isr_stub_table: [u64; 36];
 }
 
 #[repr(C, packed)]
@@ -153,6 +157,7 @@ impl Gate {
         }
     }
 
+    // DPL 3, so ring 3 may use int on this vector
     const fn user(handler: u64) -> Self {
         Gate {
             offset_low: handler as u16,
@@ -177,7 +182,13 @@ pub fn init() {
             IDT[v] = Gate::new(table[33], 0);
         }
         IDT[0x80] = Gate::user(table[34]);
+        IDT[crate::fabric::DOORBELL_VEC as usize] = Gate::new(table[35], 0);
+    }
+    load();
+}
 
+pub fn load() {
+    unsafe {
         let idtr = DescriptorTablePointer {
             limit: (core::mem::size_of::<[Gate; 256]>() - 1) as u16,
             base: core::ptr::addr_of!(IDT) as u64,
@@ -203,17 +214,22 @@ extern "C" fn interrupt_dispatch(frame: *mut Frame) {
         32 => {
             crate::apic::eoi();
             crate::user::on_tick();
+            crate::fabric::on_tick();
             crate::task::on_timer();
+        }
+        64 => {
+            crate::apic::eoi();
+            crate::fabric::on_doorbell();
+            crate::task::schedule();
         }
         128 => crate::user::syscall(f),
         255 => {}
+        // a fault in ring 3 ends that job, the core keeps going
+        v if v < 32 && f.cs & 3 == 3 => crate::user::fault(f, NAMES[v as usize]),
         v if v < 32 => {
             let name = NAMES[v as usize];
             println!("exception {}: {} (err {:#x})", v, name, f.err);
             println!("  rip={:#x} cs={:#x} rflags={:#x}", f.rip, f.cs, f.rflags);
-            if f.cs & 3 == 3 {
-                println!("  rsp={:#x} ss={:#x}", f.rsp, f.ss);
-            }
             if v == 14 {
                 println!("  cr2={:#x}", cpu::read_cr2());
             }

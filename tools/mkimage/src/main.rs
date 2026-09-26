@@ -6,7 +6,8 @@ const STAGE1_LBA: usize = 1;
 const STAGE1_SECTORS: usize = 32;
 const MANIFEST_LBA: usize = 33;
 const KERNEL_LBA: usize = 34;
-const KERNEL_MAX: usize = 512 * 1024;
+// stage1 reads the ELF to 0x20000, and the BIOS data area starts below 0xA0000
+const KERNEL_MAX: usize = 0x9_F000 - 0x2_0000;
 const IMAGE_SIZE: usize = 2 * 1024 * 1024;
 const MANIFEST_MAGIC: u32 = 0x3144_5953;
 
@@ -48,7 +49,7 @@ fn main() {
         die("stage1 exceeds 16 KiB");
     }
     if elf.len() > KERNEL_MAX {
-        die("kernel ELF exceeds 512 KiB");
+        die(&format!("kernel ELF is {} bytes, stage1 has room for {}", elf.len(), KERNEL_MAX));
     }
     if elf.len() < 0x40 || &elf[0..4] != b"\x7fELF" {
         die("kernel is not an ELF file");

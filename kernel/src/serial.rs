@@ -1,35 +1,30 @@
-use core::arch::asm;
+use crate::cpu::{self, inb, outb};
+use crate::sync::SpinLock;
 use core::fmt::{self, Write};
+use core::ptr;
+use core::sync::atomic::{AtomicPtr, Ordering};
 
 const COM1: u16 = 0x3F8;
+const LSR: u16 = COM1 + 5;
+const LSR_EMPTY: u8 = 0x20;
 
-unsafe fn outb(port: u16, val: u8) {
-    asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags));
-}
+// lives in memory shared by every core; each kernel image only holds a pointer to it
+static CONSOLE: AtomicPtr<SpinLock<()>> = AtomicPtr::new(ptr::null_mut());
 
-unsafe fn inb(port: u16) -> u8 {
-    let val: u8;
-    asm!("in al, dx", out("al") val, in("dx") port, options(nomem, nostack, preserves_flags));
-    val
-}
-
+// 115200 baud 8n1, fifos on
 pub fn init() {
-    unsafe {
-        outb(COM1 + 1, 0x00);
-        outb(COM1 + 3, 0x80);
-        outb(COM1 + 0, 0x01);
-        outb(COM1 + 1, 0x00);
-        outb(COM1 + 3, 0x03);
-        outb(COM1 + 2, 0xC7);
-        outb(COM1 + 4, 0x0B);
-    }
+    outb(COM1 + 1, 0x00);
+    outb(COM1 + 3, 0x80);
+    outb(COM1, 0x01);
+    outb(COM1 + 1, 0x00);
+    outb(COM1 + 3, 0x03);
+    outb(COM1 + 2, 0xC7);
+    outb(COM1 + 4, 0x0B);
 }
 
 fn putb(b: u8) {
-    unsafe {
-        while inb(COM1 + 5) & 0x20 == 0 {}
-        outb(COM1, b);
-    }
+    while inb(LSR) & LSR_EMPTY == 0 {}
+    outb(COM1, b);
 }
 
 pub struct Writer;
@@ -46,12 +41,24 @@ impl Write for Writer {
     }
 }
 
-pub fn _print(args: fmt::Arguments) {
-    let flags = crate::cpu::push_cli();
-    let _ = Writer.write_fmt(args);
-    crate::cpu::pop_flags(flags);
+pub fn share_console(lock: *mut SpinLock<()>) {
+    CONSOLE.store(lock, Ordering::Release);
 }
 
+pub fn console() -> *mut SpinLock<()> {
+    CONSOLE.load(Ordering::Acquire)
+}
+
+pub fn _print(args: fmt::Arguments) {
+    let flags = cpu::push_cli();
+    let lock = unsafe { CONSOLE.load(Ordering::Acquire).as_ref() };
+    let guard = lock.map(|l| l.lock());
+    let _ = Writer.write_fmt(args);
+    drop(guard);
+    cpu::pop_flags(flags);
+}
+
+#[allow(unused_macros)]
 macro_rules! print {
     ($($arg:tt)*) => ($crate::serial::_print(::core::format_args!($($arg)*)));
 }

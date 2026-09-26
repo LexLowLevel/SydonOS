@@ -7,9 +7,21 @@ const HEAP_FRAMES: u64 = 2048;
 const HDR: usize = 16;
 const MIN_BLOCK: usize = 32;
 
+// free blocks form a list sorted by address, so dealloc can merge with both
+// neighbours
+#[repr(C)]
 struct Node {
     size: usize,
     next: Option<NonNull<Node>>,
+}
+
+// the 16 bytes right before every pointer handed out: the block size, and
+// how far the block starts before this header. that is 0 unless a large
+// alignment pushed the pointer further into the block.
+unsafe fn write_header(user: usize, size: usize, back: usize) {
+    let h = (user - HDR) as *mut usize;
+    h.write(size);
+    h.add(1).write(back);
 }
 
 pub struct Heap {
@@ -23,45 +35,40 @@ impl Heap {
         Heap { head: None }
     }
 
-    unsafe fn add_region(&mut self, addr: usize, size: usize) {
-        let n = addr as *mut Node;
-        n.write(Node {
-            size,
-            next: self.head,
-        });
-        self.head = NonNull::new(n);
+    // a new region goes in like a freed block, so it lands in address order
+    // and merges with a neighbour that ends right where it starts
+    pub unsafe fn add_region(&mut self, addr: usize, size: usize) {
+        write_header(addr + HDR, size, 0);
+        self.dealloc((addr + HDR) as *mut u8);
     }
 
-    unsafe fn alloc(&mut self, layout: Layout) -> *mut u8 {
-        if layout.align() > 16 {
-            return ptr::null_mut();
-        }
-        let need = ((layout.size().max(1)) + 15) & !15;
-        let total = need + HDR;
+    pub unsafe fn alloc(&mut self, layout: Layout) -> *mut u8 {
+        let align = layout.align().max(16);
+        let need = (layout.size().max(1) + 15) & !15;
 
         let mut prev: Option<NonNull<Node>> = None;
         let mut cur = self.head;
-        while let Some(mut node) = cur {
+        while let Some(node) = cur {
             let addr = node.as_ptr() as usize;
             let size = node.as_ref().size;
+            let user = (addr + HDR + align - 1) & !(align - 1);
+            let total = user + need - addr;
             if size >= total {
                 let next = node.as_ref().next;
-                let taken = if size >= total + HDR + MIN_BLOCK {
+                // split off the tail when it is still big enough to be useful
+                let (taken, used) = if size >= total + HDR + MIN_BLOCK {
                     let split = (addr + total) as *mut Node;
-                    split.write(Node {
-                        size: size - total,
-                        next,
-                    });
-                    node.as_mut().size = total;
-                    NonNull::new(split)
+                    split.write(Node { size: size - total, next });
+                    (NonNull::new(split), total)
                 } else {
-                    next
+                    (next, size)
                 };
                 match prev {
                     None => self.head = taken,
                     Some(mut p) => p.as_mut().next = taken,
                 }
-                return (addr + HDR) as *mut u8;
+                write_header(user, used, user - HDR - addr);
+                return user as *mut u8;
             }
             prev = Some(node);
             cur = node.as_ref().next;
@@ -69,10 +76,11 @@ impl Heap {
         ptr::null_mut()
     }
 
-    unsafe fn dealloc(&mut self, ptr: *mut u8) {
-        let addr = (ptr as usize) - HDR;
+    pub unsafe fn dealloc(&mut self, ptr: *mut u8) {
+        let h = (ptr as usize - HDR) as *const usize;
+        let size = h.read();
+        let addr = ptr as usize - HDR - h.add(1).read();
         let n = addr as *mut Node;
-        let size = n.read().size;
 
         let mut prev: Option<NonNull<Node>> = None;
         let mut cur = self.head;
@@ -84,10 +92,8 @@ impl Heap {
             cur = node.as_ref().next;
         }
 
-        (*n).next = cur;
-        (*n).size = size;
+        n.write(Node { size, next: cur });
 
-        // merge with next
         if let Some(nx) = cur {
             if addr + size == nx.as_ptr() as usize {
                 (*n).size += nx.as_ref().size;
@@ -124,13 +130,15 @@ unsafe impl GlobalAlloc for LockedHeap {
 #[global_allocator]
 pub static HEAP: LockedHeap = LockedHeap(SpinLock::new(Heap::empty()));
 
-pub fn init() {
-    let base = frame::alloc_contiguous(HEAP_FRAMES).expect("heap: no contiguous region");
+pub fn init() -> u64 {
+    let frames = HEAP_FRAMES.min(frame::total_free() / 2);
+    let base = frame::alloc_contiguous(frames).expect("heap: no contiguous region");
     let mut h = HEAP.0.lock();
     unsafe {
         h.add_region(
             crate::paging::phys_to_virt(base) as usize,
-            (HEAP_FRAMES * frame::FRAME) as usize,
+            (frames * frame::FRAME) as usize,
         );
     }
+    frames * frame::FRAME
 }

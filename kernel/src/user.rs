@@ -1,6 +1,9 @@
+use crate::elf;
 use crate::frame;
 use crate::idt::Frame;
 use crate::paging::{self, phys_to_virt, USER, WRITABLE};
+use crate::smp;
+use crate::sync::SpinLock;
 use crate::task;
 use alloc::boxed::Box;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -13,16 +16,15 @@ pub const SYS_SUBMIT: u64 = 4;
 pub const SYS_POLL: u64 = 5;
 pub const SYS_WAIT: u64 = 6;
 
-const USER_LIMIT: u64 = 0x0000_8000_0000_0000;
 const STACK_PAGES: u64 = 32;
 const USER_STACK_TOP: u64 = 0x0000_0000_8000_0000;
 const PAGE: u64 = 0x1000;
 const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 const MAX_REQS: usize = 16;
 const MSG_MAX: usize = 64;
+const LINE_MAX: usize = 256;
 
 struct Launch {
-    pml4: u64,
     entry: u64,
     user_sp: u64,
 }
@@ -37,86 +39,104 @@ struct Req {
     data: [u8; MSG_MAX],
 }
 
+// whole lines only, so jobs on different cores never interleave mid-line
+struct Line {
+    buf: [u8; LINE_MAX],
+    len: usize,
+}
+
+impl Line {
+    fn flush(&mut self) {
+        let text = &self.buf[..self.len];
+        let valid = match core::str::from_utf8(text) {
+            Ok(s) => s,
+            Err(e) => unsafe { core::str::from_utf8_unchecked(&text[..e.valid_up_to()]) },
+        };
+        println!("[cpu{}] {}", smp::core(), valid);
+        self.len = 0;
+    }
+}
+
+static LINE: SpinLock<Line> = SpinLock::new(Line {
+    buf: [0; LINE_MAX],
+    len: 0,
+});
+// fake requests: each one completes a tick after submit.
+// only touched from syscalls and the timer, both with interrupts off.
 static mut REQS: [Option<Req>; MAX_REQS] = [None; MAX_REQS];
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-
-fn rd16(b: &[u8], o: usize) -> u16 {
-    u16::from_le_bytes([b[o], b[o + 1]])
-}
-
-fn rd32(b: &[u8], o: usize) -> u32 {
-    u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
-}
-
-fn rd64(b: &[u8], o: usize) -> u64 {
-    u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
-}
 
 fn reqs() -> &'static mut [Option<Req>; MAX_REQS] {
     unsafe { &mut *core::ptr::addr_of_mut!(REQS) }
 }
 
-pub fn spawn(image: &[u8]) {
-    let launch = Box::new(load(image));
-    task::spawn(run, Box::into_raw(launch) as u64);
+pub fn spawn(image: &[u8]) -> bool {
+    let Some((pml4, launch)) = load(image) else {
+        return false;
+    };
+    let arg = Box::into_raw(Box::new(launch));
+    if task::spawn_in(run, arg as u64, pml4).is_none() {
+        drop(unsafe { Box::from_raw(arg) });
+        paging::free_user_space(pml4);
+        return false;
+    }
+    true
 }
 
 fn run(arg: u64) {
     let launch = unsafe { Box::from_raw(arg as *mut Launch) };
-    unsafe {
-        paging::activate(launch.pml4);
-        enter(launch.entry, launch.user_sp);
-    }
+    unsafe { enter(launch.entry, launch.user_sp) }
 }
 
+// the top half points at the same lower tables, so kernel mappings are shared
 fn inherit_kernel_half(pml4: u64) {
     let cur = crate::cpu::read_cr3() & ADDR_MASK;
     unsafe {
-        let k = (phys_to_virt(cur) as *mut u64).add(511).read_volatile();
-        (phys_to_virt(pml4) as *mut u64).add(511).write_volatile(k);
+        for i in 256..512 {
+            let k = (phys_to_virt(cur) as *mut u64).add(i).read_volatile();
+            (phys_to_virt(pml4) as *mut u64).add(i).write_volatile(k);
+        }
     }
 }
 
-fn load(image: &[u8]) -> Launch {
-    assert!(image.len() >= 0x40 && &image[0..4] == b"\x7fELF", "user: not ELF");
-    let entry = rd64(image, 0x18);
-    let phoff = rd64(image, 0x20) as usize;
-    let phentsize = rd16(image, 0x36) as usize;
-    let phnum = rd16(image, 0x38) as usize;
-
-    let pml4 = frame::alloc_zeroed().expect("user: no pml4");
+// segments must stay below the stack
+fn load(image: &[u8]) -> Option<(u64, Launch)> {
+    let stack_bottom = USER_STACK_TOP - STACK_PAGES * PAGE;
+    let fits = |s: &elf::Segment| s.vaddr.checked_add(s.memsz).is_some_and(|end| end <= stack_bottom);
+    if !elf::is_elf(image) || !elf::segments(image).all(|s| fits(&s)) {
+        return None;
+    }
+    let pml4 = frame::alloc_zeroed()?;
     inherit_kernel_half(pml4);
+    if fill(pml4, image).is_none() {
+        paging::free_user_space(pml4);
+        return None;
+    }
+    Some((pml4, Launch { entry: elf::entry(image), user_sp: USER_STACK_TOP }))
+}
 
-    for i in 0..phnum {
-        let p = phoff + i * phentsize;
-        if rd32(image, p) != 1 {
-            continue;
-        }
-        let p_offset = rd64(image, p + 0x08);
-        let p_vaddr = rd64(image, p + 0x10);
-        let p_filesz = rd64(image, p + 0x20);
-        let p_memsz = rd64(image, p + 0x28);
-        assert!(p_vaddr < USER_LIMIT, "user: segment above user limit");
-        let mut v = p_vaddr & !(PAGE - 1);
-        let vend = (p_vaddr + p_memsz + PAGE - 1) & !(PAGE - 1);
+fn fill(pml4: u64, image: &[u8]) -> Option<()> {
+    for seg in elf::segments(image) {
+        let mut v = seg.vaddr & !(PAGE - 1);
+        let vend = (seg.vaddr + seg.memsz + PAGE - 1) & !(PAGE - 1);
         while v < vend {
             // a page shared with a previous segment keeps its frame
             let f = match paging::translate(pml4, v) {
                 Some(pa) => pa & !(PAGE - 1),
                 None => {
-                    let f = frame::alloc_zeroed().expect("user: out of frames");
+                    let f = frame::alloc_zeroed()?;
                     unsafe {
                         paging::map_4k(pml4, v, f, USER | WRITABLE);
                     }
                     f
                 }
             };
-            let lo = p_vaddr.max(v);
-            let hi = (p_vaddr + p_filesz).min(v + PAGE);
+            let lo = seg.vaddr.max(v);
+            let hi = (seg.vaddr + seg.filesz).min(v + PAGE);
             if hi > lo {
                 unsafe {
                     let dst = (phys_to_virt(f) as *mut u8).add((lo - v) as usize);
-                    let src = image.as_ptr().add((p_offset + (lo - p_vaddr)) as usize);
+                    let src = image.as_ptr().add((seg.offset + (lo - seg.vaddr)) as usize);
                     dst.copy_from_nonoverlapping(src, (hi - lo) as usize);
                 }
             }
@@ -127,19 +147,15 @@ fn load(image: &[u8]) -> Launch {
     let mut sp = USER_STACK_TOP;
     while sp > USER_STACK_TOP - STACK_PAGES * PAGE {
         sp -= PAGE;
-        let f = frame::alloc_zeroed().expect("user: out of frames");
+        let f = frame::alloc_zeroed()?;
         unsafe {
             paging::map_4k(pml4, sp, f, USER | WRITABLE);
         }
     }
-
-    Launch {
-        pml4,
-        entry,
-        user_sp: USER_STACK_TOP,
-    }
+    Some(())
 }
 
+// iretq pops rip, cs, rflags, rsp, ss. rflags 0x202 turns interrupts on in ring 3.
 unsafe fn enter(entry: u64, user_sp: u64) -> ! {
     core::arch::asm!(
         "push {udata}",
@@ -156,6 +172,25 @@ unsafe fn enter(entry: u64, user_sp: u64) -> ! {
     )
 }
 
+pub fn fault(f: &Frame, name: &str) -> ! {
+    println!(
+        "cpu {}: task {} killed by {} at {:#x} (cr2 {:#x})",
+        smp::core(),
+        task::current(),
+        name,
+        f.rip,
+        crate::cpu::read_cr2()
+    );
+    task::exit_current()
+}
+
+fn user_bytes<'a>(ptr: u64, len: u64, max: usize) -> Option<&'a [u8]> {
+    if len as usize > max || !paging::user_range_ok(paging::current(), ptr, len) {
+        return None;
+    }
+    Some(unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) })
+}
+
 pub fn syscall(f: &mut Frame) {
     match f.rax {
         SYS_PRINT => sys_print(f),
@@ -170,28 +205,34 @@ pub fn syscall(f: &mut Frame) {
 }
 
 fn sys_print(f: &mut Frame) {
-    let len = f.rsi as usize;
-    if f.rdi >= USER_LIMIT || len > 256 {
+    let Some(bytes) = user_bytes(f.rdi, f.rsi, LINE_MAX) else {
+        f.rax = u64::MAX;
+        return;
+    };
+    if core::str::from_utf8(bytes).is_err() {
         f.rax = u64::MAX;
         return;
     }
-    let bytes = unsafe { core::slice::from_raw_parts(f.rdi as *const u8, len) };
-    match core::str::from_utf8(bytes) {
-        Ok(s) => {
-            print!("{}", s);
-            f.rax = 0;
+    let mut line = LINE.lock();
+    for &b in bytes {
+        if b == b'\n' || line.len == LINE_MAX {
+            line.flush();
         }
-        Err(_) => f.rax = u64::MAX,
+        if b != b'\n' {
+            let n = line.len;
+            line.buf[n] = b;
+            line.len += 1;
+        }
     }
+    f.rax = 0;
 }
 
 fn submit(ptr: u64, len: u64) -> u64 {
-    if ptr >= USER_LIMIT || len == 0 || len as usize > MSG_MAX {
+    let Some(src) = user_bytes(ptr, len, MSG_MAX).filter(|s| !s.is_empty()) else {
         return u64::MAX;
-    }
-    let src = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
+    };
     let mut data = [0u8; MSG_MAX];
-    data[..len as usize].copy_from_slice(src);
+    data[..src.len()].copy_from_slice(src);
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     for slot in reqs().iter_mut() {
         if slot.is_none() {
@@ -200,7 +241,7 @@ fn submit(ptr: u64, len: u64) -> u64 {
                 owner: task::current(),
                 waiter: false,
                 ready_at: task::ticks() + 1,
-                len: len as usize,
+                len: src.len(),
                 data,
             });
             return id;
@@ -209,13 +250,15 @@ fn submit(ptr: u64, len: u64) -> u64 {
     u64::MAX
 }
 
+// only the task that submitted a request may collect it
 fn complete(id: u64, out: u64) -> Option<usize> {
-    if out >= USER_LIMIT {
-        return None;
-    }
+    let me = task::current();
     for slot in reqs().iter_mut() {
         if let Some(req) = slot {
-            if req.id == id && req.ready_at <= task::ticks() {
+            if req.id == id && req.owner == me && req.ready_at <= task::ticks() {
+                if !paging::user_range_ok(paging::current(), out, req.len as u64) {
+                    return None;
+                }
                 let len = req.len;
                 let data = req.data;
                 *slot = None;
@@ -234,6 +277,7 @@ fn poll_now(id: u64, out: u64) -> u64 {
 }
 
 fn wait(id: u64, out: u64) -> u64 {
+    let me = task::current();
     loop {
         if complete(id, out).is_some() {
             return 1;
@@ -243,23 +287,20 @@ fn wait(id: u64, out: u64) -> u64 {
         let mut armed = false;
         for slot in reqs().iter_mut() {
             if let Some(req) = slot {
-                if req.id == id {
+                if req.id == id && req.owner == me {
                     seen = true;
                     if req.ready_at > now {
                         req.waiter = true;
-                        req.owner = task::current();
                         armed = true;
                     }
                     break;
                 }
             }
         }
-        if !seen {
+        if !seen || !armed {
             return u64::MAX;
         }
-        if armed {
-            task::block_current();
-        }
+        task::block_current();
     }
 }
 

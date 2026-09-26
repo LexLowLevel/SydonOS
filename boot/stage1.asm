@@ -38,6 +38,7 @@ stage1_start:
     mov dword [dap_lba], MANIFEST_LBA
     mov dword [dap_lba + 4], 0
     call disk_read
+    ; the manifest sector holds a magic and the kernel ELF size
     cmp dword [MANIFEST], 0x31445953
     jne bad_manifest
     mov eax, [MANIFEST + 4]
@@ -56,11 +57,12 @@ stage1_start:
     mov [BOOTINFO + 24], eax
     mov dword [BOOTINFO + 28], 0
 
+    ; E820 memory map straight into BootInfo, 24 bytes per entry
     xor bp, bp
     mov di, BOOTINFO + 32
     xor ebx, ebx
 .e820:
-    mov dword [di + 20], 1
+    mov dword [di + 20], 1      ; ACPI 3 attribute: entry valid
     mov eax, 0xE820
     mov edx, 0x534D4150
     mov ecx, 24
@@ -88,6 +90,7 @@ stage1_start:
     mov cr0, eax
     jmp 0x08:pm_entry
 
+; reads the ELF in 64-sector chunks, moving the segment 32 KiB each time
 load_kernel:
     mov word [cur_seg], KERN_BUF >> 4
     mov dword [cur_lba], KERN_LBA
@@ -208,6 +211,9 @@ pm_entry:
     mov ss, ax
     mov esp, 0x7C00
 
+    ; tables at 0x1000-0x6FFF, all 2 MiB pages. identity maps 0-2 GiB and
+    ; 3-4 GiB (LAPIC), and the top 2 GiB of the address space maps 0-2 GiB
+    ; again for the kernel.
     xor eax, eax
     mov edi, 0x1000
     mov ecx, 0x6000 / 4
@@ -239,11 +245,11 @@ pm_entry:
     mov eax, 0x1000
     mov cr3, eax
     mov eax, cr4
-    or eax, 1 << 5
+    or eax, 1 << 5              ; PAE
     mov cr4, eax
     mov ecx, 0xC0000080
     rdmsr
-    or eax, 1 << 8
+    or eax, 1 << 8              ; EFER.LME
     wrmsr
     mov eax, cr0
     or eax, 0x80000000
@@ -269,6 +275,8 @@ lm_entry:
     mov esp, 0x7C00
     PUTC 'L'
 
+    ; copy each PT_LOAD to its physical address (p_paddr, or p_vaddr if
+    ; that is 0) and zero the bss tail
     mov rsi, KERN_BUF
     cmp dword [rsi], 0x464C457F
     jne elf_bad
@@ -301,7 +309,7 @@ lm_entry:
     dec ebx
     jmp .ph
 .ph_done:
-    mov rdi, BOOTINFO
+    mov rdi, BOOTINFO           ; kernel_main(boot_info)
     jmp r10
 
 elf_bad:

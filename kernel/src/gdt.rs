@@ -29,7 +29,9 @@ struct Tss {
 }
 
 #[repr(align(16))]
-struct Stack([u8; 4096]);
+struct Stack {
+    _bytes: [u8; 4096],
+}
 
 static mut GDT: [u64; 7] = [0; 7];
 static mut TSS: Tss = Tss {
@@ -44,11 +46,12 @@ static mut TSS: Tss = Tss {
     _r3: 0,
     iomap_base: size_of::<Tss>() as u16,
 };
-static mut DF_STACK: Stack = Stack([0; 4096]);
+static mut DF_STACK: Stack = Stack { _bytes: [0; 4096] };
 
 pub fn init(rsp0: u64) {
     unsafe {
         write_unaligned(addr_of_mut!(TSS.rsp0), rsp0);
+        // double faults switch to their own stack, so a blown stack still gets reported
         write_unaligned(
             addr_of_mut!(TSS.ist1),
             addr_of_mut!(DF_STACK) as u64 + 4096,
@@ -89,6 +92,7 @@ fn tss_desc(base: u64, limit: u32) -> (u64, u64) {
     (lo, base >> 32)
 }
 
+// CS can only be reloaded with a far jump or return, so push cs:rip and retfq
 unsafe fn load_gdt(gdtr: &DescriptorTablePointer) {
     asm!(
         "lgdt [{}]",

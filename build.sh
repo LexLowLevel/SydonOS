@@ -6,6 +6,7 @@ mkdir -p out
 
 nasm -f bin boot/stage0.asm -o out/stage0.bin
 nasm -f bin boot/stage1.asm -o out/stage1.bin
+nasm -f bin boot/trampoline.asm -o out/trampoline.bin
 
 cargo build --release --target x86_64-unknown-none -p job-hello
 cargo build --release --target x86_64-unknown-none -p sydon-kernel
