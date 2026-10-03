@@ -2,7 +2,7 @@ use crate::acpi::{Cpus, MAX_CPUS};
 use crate::paging::{self, phys_to_virt, WRITABLE};
 use crate::fabric::{self, Arena};
 use crate::sync::SpinLock;
-use crate::{apic, elf, frame, gdt, heap, idt, pit, serial, task};
+use crate::{apic, clock, elf, frame, gdt, heap, idt, pit, rpc, serial, task};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 static TRAMPOLINE_BIN: &[u8] = include_bytes!(concat!(
@@ -31,6 +31,7 @@ struct Params {
     mem_base: u64,
     mem_frames: u64,
     timer_count: u64,
+    tsc_per_ms: u64,
     console: u64,
     arena: u64,
     cores: u64,
@@ -45,6 +46,12 @@ struct Ap {
     pml4: u64,
     mem_base: u64,
     mem_frames: u64,
+}
+
+struct Shared {
+    timer_count: u64,
+    tsc_per_ms: u64,
+    arena: Arena,
 }
 
 pub fn core() -> usize {
@@ -84,11 +91,7 @@ pub fn share_console() {
     serial::share_console(lock);
 }
 
-// every AP gets its own kernel copy and page tables first, then a slice of
-// what is left
-pub fn start_aps(cpus: &Cpus, kernel_elf: &[u8], timer_count: u32) -> usize {
-    assert!(TRAMPOLINE_BIN.len() <= (PARAMS - TRAMPOLINE) as usize, "smp: trampoline too big");
-    assert!(elf::is_elf(kernel_elf), "smp: kernel image is not ELF");
+fn install_trampoline() {
     unsafe {
         core::ptr::copy_nonoverlapping(
             TRAMPOLINE_BIN.as_ptr(),
@@ -96,6 +99,21 @@ pub fn start_aps(cpus: &Cpus, kernel_elf: &[u8], timer_count: u32) -> usize {
             TRAMPOLINE_BIN.len(),
         );
     }
+}
+
+fn kernel_space(image: u64) -> u64 {
+    let pml4 = paging::build_kernel_space(image);
+    assert!(pml4 < 1 << 32, "smp: ap tables above 4 GiB");
+    unsafe {
+        paging::map_4k(pml4, TRAMPOLINE, TRAMPOLINE, WRITABLE);
+    }
+    pml4
+}
+
+pub fn start_aps(cpus: &Cpus, kernel_elf: &[u8], timer_count: u32, tsc_per_ms: u64) -> usize {
+    assert!(TRAMPOLINE_BIN.len() <= (PARAMS - TRAMPOLINE) as usize, "smp: trampoline too big");
+    assert!(elf::is_elf(kernel_elf), "smp: kernel image is not ELF");
+    install_trampoline();
 
     let bsp = apic::id();
     let mut aps = [Ap { apic_id: 0, core: 0, pml4: 0, mem_base: 0, mem_frames: 0 }; MAX_CPUS];
@@ -105,20 +123,14 @@ pub fn start_aps(cpus: &Cpus, kernel_elf: &[u8], timer_count: u32) -> usize {
             set_core(core);
             continue;
         }
-        let pml4 = paging::build_kernel_space(copy_image(kernel_elf));
-        assert!(pml4 < 1 << 32, "smp: ap tables above 4 GiB");
-        unsafe {
-            paging::map_4k(pml4, TRAMPOLINE, TRAMPOLINE, WRITABLE);
-        }
-        aps[n] = Ap { apic_id, core, pml4, mem_base: 0, mem_frames: 0 };
+        aps[n] = Ap { apic_id, core, pml4: kernel_space(copy_image(kernel_elf)), mem_base: 0, mem_frames: 0 };
         n += 1;
     }
 
     let arena = Arena::create(&cpus.apic_ids[..cpus.count], fabric::SLOTS);
     fabric::init(arena, core());
 
-    // a core's memory must be one block, and ram comes in a few ranges, so
-    // an equal share may not fit anywhere. then smaller blocks will do.
+    // ram is split into ranges, so fall back to smaller blocks
     let share = frame::total_free() / cpus.count as u64;
     for ap in &mut aps[..n] {
         let mut want = share;
@@ -133,23 +145,10 @@ pub fn start_aps(cpus: &Cpus, kernel_elf: &[u8], timer_count: u32) -> usize {
         ap.mem_frames = want;
     }
 
-    let params = unsafe { &mut *(phys_to_virt(PARAMS) as *mut Params) };
+    let shared = Shared { timer_count: timer_count as u64, tsc_per_ms, arena };
     let mut online = 0;
     for ap in &aps[..n] {
-        params.cr3 = ap.pml4;
-        params.stack = core::ptr::addr_of!(__stack_top) as u64;
-        params.entry = ap_entry as usize as u64;
-        params.core = ap.core as u64;
-        params.mem_base = ap.mem_base;
-        params.mem_frames = ap.mem_frames;
-        params.timer_count = timer_count as u64;
-        params.console = serial::console() as u64;
-        params.arena = arena.phys;
-        params.cores = arena.cores as u64;
-        params.slots = arena.slots;
-        params.ack.store(0, Ordering::Release);
-
-        if boot(ap.apic_id, &params.ack) {
+        if boot(ap, &shared) {
             online += 1;
         } else {
             println!("smp: cpu {} (apic {}) did not respond", ap.core, ap.apic_id);
@@ -158,29 +157,45 @@ pub fn start_aps(cpus: &Cpus, kernel_elf: &[u8], timer_count: u32) -> usize {
     online
 }
 
-fn boot(apic_id: u8, ack: &AtomicU64) -> bool {
+fn boot(ap: &Ap, s: &Shared) -> bool {
+    let params = unsafe { &mut *(phys_to_virt(PARAMS) as *mut Params) };
+    params.cr3 = ap.pml4;
+    params.stack = core::ptr::addr_of!(__stack_top) as u64;
+    params.entry = ap_entry as usize as u64;
+    params.core = ap.core as u64;
+    params.mem_base = ap.mem_base;
+    params.mem_frames = ap.mem_frames;
+    params.timer_count = s.timer_count;
+    params.tsc_per_ms = s.tsc_per_ms;
+    params.console = serial::console() as u64;
+    params.arena = s.arena.phys;
+    params.cores = s.arena.cores as u64;
+    params.slots = s.arena.slots;
+    params.ack.store(0, Ordering::Release);
+
     let page = (TRAMPOLINE >> 12) as u8;
-    apic::send_init(apic_id);
+    apic::send_init(ap.apic_id);
     pit::sleep_us(10_000);
-    apic::send_sipi(apic_id, page);
+    apic::send_sipi(ap.apic_id, page);
     pit::sleep_us(200);
-    if ack.load(Ordering::Acquire) == 0 {
-        apic::send_sipi(apic_id, page);
+    if params.ack.load(Ordering::Acquire) == 0 {
+        apic::send_sipi(ap.apic_id, page);
     }
     let mut waited = 0;
-    while ack.load(Ordering::Acquire) == 0 && waited < ACK_TIMEOUT_US {
+    while params.ack.load(Ordering::Acquire) == 0 && waited < ACK_TIMEOUT_US {
         pit::sleep_us(100);
         waited += 100;
     }
-    ack.load(Ordering::Acquire) != 0
+    params.ack.load(Ordering::Acquire) != 0
 }
 
 // runs in this core's own kernel copy: every static below starts fresh
 extern "C" fn ap_entry(params: *const Params) -> ! {
     let p = unsafe { &*params };
     paging::use_physmap();
-    serial::share_console(p.console as *mut SpinLock<()>);
+    serial::share_console(p.console as *mut _);
     set_core(p.core as usize);
+    clock::set(p.tsc_per_ms);
     task::init(paging::current());
 
     gdt::init(core::ptr::addr_of!(__stack_top) as u64);
@@ -191,16 +206,12 @@ extern "C" fn ap_entry(params: *const Params) -> ! {
     apic::start_timer(p.timer_count as u32);
     let arena = Arena { phys: p.arena, cores: p.cores as usize, slots: p.slots };
     fabric::init(arena, p.core as usize);
-    println!(
-        "smp: cpu {} online, {} MiB, heap {} KiB",
-        p.core,
-        p.mem_frames * frame::FRAME >> 20,
-        heap >> 10
-    );
+    rpc::init();
+    println!("smp: cpu {} online, {} MiB, heap {} KiB", p.core, p.mem_frames * frame::FRAME >> 20, heap >> 10);
 
     p.ack.store(1, Ordering::Release);
     unsafe {
         paging::unmap_4k(paging::current(), TRAMPOLINE);
     }
-    crate::run_jobs()
+    crate::run_core()
 }

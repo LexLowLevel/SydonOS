@@ -1,9 +1,21 @@
 [workspace]
-members = ["kernel", "tools/mkimage", "jobs/hello"]
+members = [
+    "kernel",
+    "lib/freelist",
+    "rt",
+    "jobs/hello",
+    "jobs/echod",
+    "jobs/ping",
+    "jobs/ticker",
+    "jobs/fault",
+    "jobs/flood",
+    "tools/mkimage",
+]
 resolver = "2"
 
 [profile.release]
 panic = "abort"
+strip = true
 
 [profile.dev]
 panic = "abort"

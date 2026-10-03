@@ -75,9 +75,13 @@ pub fn init(rsp0: u64) {
     }
 }
 
+// where the syscall entry switches to, kept equal to rsp0
+pub static mut SYSCALL_RSP: u64 = 0;
+
 pub fn set_rsp0(rsp0: u64) {
     unsafe {
         write_unaligned(addr_of_mut!(TSS.rsp0), rsp0);
+        SYSCALL_RSP = rsp0;
     }
 }
 

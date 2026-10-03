@@ -19,8 +19,7 @@ fn rd64(b: &[u8], o: usize) -> u64 {
     u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
 }
 
-// a 64-bit little-endian ELF whose program headers and loadable bytes all
-// lie inside the image. everything else here trusts that this was checked.
+// the other functions trust the image once this passed
 pub fn is_elf(image: &[u8]) -> bool {
     if image.len() < 0x40 || &image[0..4] != b"\x7fELF" || image[4] != 2 || image[5] != 1 {
         return false;

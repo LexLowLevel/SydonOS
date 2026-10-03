@@ -1,0 +1,11 @@
+[package]
+name = "job-ticker"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "job-ticker"
+path = "src/main.rs"
+
+[dependencies]
+sydon-rt = { path = "../../rt" }

@@ -72,7 +72,6 @@ pub fn enable() {
     }
 }
 
-// timer counts per `us` microseconds, measured against the PIT
 pub fn calibrate(us: u64) -> u32 {
     unsafe {
         write(REG_LVT_TIMER, MASKED);

@@ -1,28 +1,41 @@
+use crate::director;
 use crate::elf;
 use crate::frame;
 use crate::idt::Frame;
 use crate::paging::{self, phys_to_virt, USER, WRITABLE};
-use crate::smp;
-use crate::sync::SpinLock;
-use crate::task;
+use crate::rpc::{self, Answer, Body, Taken, BUSY, INVALID, NOT_FOUND, NO_MEMORY, OK, PAYLOAD};
+use crate::sync::IrqCell;
+use crate::task::{self, MAX_TASKS};
+use crate::{clock, jobs, smp};
 use alloc::boxed::Box;
-use core::sync::atomic::{AtomicU64, Ordering};
 
-pub const SYS_PRINT: u64 = 0;
-pub const SYS_EXIT: u64 = 1;
-pub const SYS_YIELD: u64 = 2;
-pub const SYS_TIME: u64 = 3;
-pub const SYS_SUBMIT: u64 = 4;
-pub const SYS_POLL: u64 = 5;
-pub const SYS_WAIT: u64 = 6;
+const SYS_PRINT: u64 = 0;
+const SYS_EXIT: u64 = 1;
+const SYS_YIELD: u64 = 2;
+const SYS_TIME: u64 = 3;
+const SYS_SUBMIT: u64 = 4;
+const SYS_POLL: u64 = 5;
+const SYS_WAIT: u64 = 6;
+const SYS_LOOKUP: u64 = 7;
+const SYS_REGISTER: u64 = 8;
+const SYS_RECV: u64 = 9;
+const SYS_REPLY: u64 = 10;
+const SYS_INFO: u64 = 11;
+const SYS_GROW: u64 = 12;
+const SYS_SLEEP: u64 = 13;
 
+const PENDING: u64 = u64::MAX;
+const BAD_ID: u64 = u64::MAX - 1;
+
+const PRINT_MAX: usize = 256;
 const STACK_PAGES: u64 = 32;
 const USER_STACK_TOP: u64 = 0x0000_0000_8000_0000;
+const HEAP_BASE: u64 = 0x0000_0000_1000_0000;
+const HEAP_MAX: u64 = 64 << 20;
 const PAGE: u64 = 0x1000;
 const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
-const MAX_REQS: usize = 16;
-const MSG_MAX: usize = 64;
-const LINE_MAX: usize = 256;
+const CRASH_CODE: u64 = 255;
+pub const KILLED_CODE: u64 = 130;
 
 struct Launch {
     entry: u64,
@@ -30,62 +43,48 @@ struct Launch {
 }
 
 #[derive(Clone, Copy)]
-struct Req {
-    id: u64,
-    owner: usize,
-    waiter: bool,
-    ready_at: u64,
-    len: usize,
-    data: [u8; MSG_MAX],
+struct Proc {
+    pid: u64,
+    heap_top: u64,
 }
 
-// whole lines only, so jobs on different cores never interleave mid-line
-struct Line {
-    buf: [u8; LINE_MAX],
-    len: usize,
+static PROCS: IrqCell<[Option<Proc>; MAX_TASKS]> = IrqCell::new([None; MAX_TASKS]);
+
+fn err(status: u8) -> u64 {
+    u64::MAX - status as u64
 }
 
-impl Line {
-    fn flush(&mut self) {
-        let text = &self.buf[..self.len];
-        let valid = match core::str::from_utf8(text) {
-            Ok(s) => s,
-            Err(e) => unsafe { core::str::from_utf8_unchecked(&text[..e.valid_up_to()]) },
-        };
-        println!("[cpu{}] {}", smp::core(), valid);
-        self.len = 0;
+pub fn load_job(pid: u64, name: &[u8]) -> Answer {
+    let Some(b) = jobs::builtin(name) else {
+        return Answer::Reply(NOT_FOUND, Body::EMPTY);
+    };
+    match spawn_image(pid, b.image) {
+        Ok(()) => Answer::Reply(OK, Body::EMPTY),
+        Err(status) => Answer::Reply(status, Body::EMPTY),
     }
 }
 
-static LINE: SpinLock<Line> = SpinLock::new(Line {
-    buf: [0; LINE_MAX],
-    len: 0,
-});
-// fake requests: each one completes a tick after submit.
-// only touched from syscalls and the timer, both with interrupts off.
-static mut REQS: [Option<Req>; MAX_REQS] = [None; MAX_REQS];
-static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-
-fn reqs() -> &'static mut [Option<Req>; MAX_REQS] {
-    unsafe { &mut *core::ptr::addr_of_mut!(REQS) }
-}
-
-pub fn spawn(image: &[u8]) -> bool {
-    let Some((pml4, launch)) = load(image) else {
-        return false;
-    };
+fn spawn_image(pid: u64, image: &[u8]) -> Result<(), u8> {
+    let (pml4, launch) = load(image)?;
     let arg = Box::into_raw(Box::new(launch));
-    if task::spawn_in(run, arg as u64, pml4).is_none() {
+    // the job must not run before its Proc exists
+    let flags = crate::cpu::push_cli();
+    let tid = task::spawn_in(run, arg as u64, false, pml4);
+    if let Some(tid) = tid {
+        PROCS.with(|p| p[tid] = Some(Proc { pid, heap_top: HEAP_BASE }));
+    }
+    crate::cpu::pop_flags(flags);
+    if tid.is_none() {
         drop(unsafe { Box::from_raw(arg) });
         paging::free_user_space(pml4);
-        return false;
+        return Err(BUSY);
     }
-    true
+    Ok(())
 }
 
 fn run(arg: u64) {
-    let launch = unsafe { Box::from_raw(arg as *mut Launch) };
-    unsafe { enter(launch.entry, launch.user_sp) }
+    let l = unsafe { Box::from_raw(arg as *mut Launch) };
+    unsafe { enter(l.entry, l.user_sp) }
 }
 
 // the top half points at the same lower tables, so kernel mappings are shared
@@ -99,23 +98,24 @@ fn inherit_kernel_half(pml4: u64) {
     }
 }
 
-// segments must stay below the stack
-fn load(image: &[u8]) -> Option<(u64, Launch)> {
-    let stack_bottom = USER_STACK_TOP - STACK_PAGES * PAGE;
-    let fits = |s: &elf::Segment| s.vaddr.checked_add(s.memsz).is_some_and(|end| end <= stack_bottom);
+// segments must stay below the heap, which sits below the stack
+fn load(image: &[u8]) -> Result<(u64, Launch), u8> {
+    let fits = |s: &elf::Segment| s.vaddr.checked_add(s.memsz).is_some_and(|end| end <= HEAP_BASE);
     if !elf::is_elf(image) || !elf::segments(image).all(|s| fits(&s)) {
-        return None;
+        return Err(INVALID);
     }
-    let pml4 = frame::alloc_zeroed()?;
+    let pml4 = frame::alloc_zeroed().ok_or(NO_MEMORY)?;
     inherit_kernel_half(pml4);
-    if fill(pml4, image).is_none() {
-        paging::free_user_space(pml4);
-        return None;
+    match fill(pml4, image) {
+        Ok(()) => Ok((pml4, Launch { entry: elf::entry(image), user_sp: USER_STACK_TOP })),
+        Err(status) => {
+            paging::free_user_space(pml4);
+            Err(status)
+        }
     }
-    Some((pml4, Launch { entry: elf::entry(image), user_sp: USER_STACK_TOP }))
 }
 
-fn fill(pml4: u64, image: &[u8]) -> Option<()> {
+fn fill(pml4: u64, image: &[u8]) -> Result<(), u8> {
     for seg in elf::segments(image) {
         let mut v = seg.vaddr & !(PAGE - 1);
         let vend = (seg.vaddr + seg.memsz + PAGE - 1) & !(PAGE - 1);
@@ -124,7 +124,7 @@ fn fill(pml4: u64, image: &[u8]) -> Option<()> {
             let f = match paging::translate(pml4, v) {
                 Some(pa) => pa & !(PAGE - 1),
                 None => {
-                    let f = frame::alloc_zeroed()?;
+                    let f = frame::alloc_zeroed().ok_or(NO_MEMORY)?;
                     unsafe {
                         paging::map_4k(pml4, v, f, USER | WRITABLE);
                     }
@@ -147,12 +147,12 @@ fn fill(pml4: u64, image: &[u8]) -> Option<()> {
     let mut sp = USER_STACK_TOP;
     while sp > USER_STACK_TOP - STACK_PAGES * PAGE {
         sp -= PAGE;
-        let f = frame::alloc_zeroed()?;
+        let f = frame::alloc_zeroed().ok_or(NO_MEMORY)?;
         unsafe {
             paging::map_4k(pml4, sp, f, USER | WRITABLE);
         }
     }
-    Some(())
+    Ok(())
 }
 
 // iretq pops rip, cs, rflags, rsp, ss. rflags 0x202 turns interrupts on in ring 3.
@@ -172,146 +172,174 @@ unsafe fn enter(entry: u64, user_sp: u64) -> ! {
     )
 }
 
+fn current_pid() -> u64 {
+    PROCS.with(|p| p[task::current()].map_or(0, |p| p.pid))
+}
+
+pub fn kill(pid: u64) -> bool {
+    let tid = PROCS.with(|p| p.iter().position(|p| p.is_some_and(|p| p.pid == pid)));
+    if let Some(tid) = tid {
+        task::kill(tid);
+    }
+    tid.is_some()
+}
+
+pub fn exit_job(code: u64) -> ! {
+    let tid = task::current();
+    let pid = PROCS.with(|p| p[tid].take()).map_or(0, |p| p.pid);
+    let director = rpc::handle(0, rpc::SVC_DIRECTOR);
+    for h in rpc::drop_task(tid) {
+        rpc::oneway(director, director::OP_UNREGISTER, Body::words(&[h]));
+    }
+    rpc::oneway(director, director::OP_EXITED, Body::words(&[pid, code]));
+    task::exit_current()
+}
+
 pub fn fault(f: &Frame, name: &str) -> ! {
     println!(
-        "cpu {}: task {} killed by {} at {:#x} (cr2 {:#x})",
+        "cpu {}: pid {} killed by {} at {:#x} (cr2 {:#x})",
         smp::core(),
-        task::current(),
+        current_pid(),
         name,
         f.rip,
         crate::cpu::read_cr2()
     );
-    task::exit_current()
+    exit_job(CRASH_CODE)
+}
+
+fn user_ok(ptr: u64, len: u64) -> bool {
+    paging::user_range_ok(paging::current(), ptr, len)
 }
 
 fn user_bytes<'a>(ptr: u64, len: u64, max: usize) -> Option<&'a [u8]> {
-    if len as usize > max || !paging::user_range_ok(paging::current(), ptr, len) {
+    if len as usize > max || !user_ok(ptr, len) {
         return None;
     }
     Some(unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) })
 }
 
+fn copy_out(out: u64, body: &Body) -> bool {
+    if !user_ok(out, PAYLOAD as u64) {
+        return false;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(body.data.as_ptr(), out as *mut u8, PAYLOAD);
+    }
+    true
+}
+
+fn done(out: u64, status: u8, body: &Body) -> u64 {
+    if !copy_out(out, body) {
+        return err(INVALID);
+    }
+    (status as u64) << 8 | body.len as u64
+}
+
+fn timeout(ns: u64) -> u64 {
+    match ns {
+        0 => rpc::DEFAULT_TIMEOUT,
+        u64::MAX => rpc::NEVER,
+        ns => ns.div_ceil(clock::TICK_US * 1000).max(1),
+    }
+}
+
 pub fn syscall(f: &mut Frame) {
-    match f.rax {
-        SYS_PRINT => sys_print(f),
-        SYS_EXIT => task::exit_current(),
-        SYS_YIELD => task::schedule(),
-        SYS_TIME => f.rax = task::ticks(),
-        SYS_SUBMIT => f.rax = submit(f.rdi, f.rsi),
-        SYS_POLL => f.rax = poll_now(f.rdi, f.rsi),
-        SYS_WAIT => f.rax = wait(f.rdi, f.rsi),
-        _ => f.rax = u64::MAX,
+    if matches!(f.rax, SYS_SUBMIT..=SYS_WAIT | SYS_RECV | SYS_REPLY) {
+        rpc::syscall_active();
     }
-}
-
-fn sys_print(f: &mut Frame) {
-    let Some(bytes) = user_bytes(f.rdi, f.rsi, LINE_MAX) else {
-        f.rax = u64::MAX;
-        return;
-    };
-    if core::str::from_utf8(bytes).is_err() {
-        f.rax = u64::MAX;
-        return;
-    }
-    let mut line = LINE.lock();
-    for &b in bytes {
-        if b == b'\n' || line.len == LINE_MAX {
-            line.flush();
-        }
-        if b != b'\n' {
-            let n = line.len;
-            line.buf[n] = b;
-            line.len += 1;
-        }
-    }
-    f.rax = 0;
-}
-
-fn submit(ptr: u64, len: u64) -> u64 {
-    let Some(src) = user_bytes(ptr, len, MSG_MAX).filter(|s| !s.is_empty()) else {
-        return u64::MAX;
-    };
-    let mut data = [0u8; MSG_MAX];
-    data[..src.len()].copy_from_slice(src);
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    for slot in reqs().iter_mut() {
-        if slot.is_none() {
-            *slot = Some(Req {
-                id,
-                owner: task::current(),
-                waiter: false,
-                ready_at: task::ticks() + 1,
-                len: src.len(),
-                data,
-            });
-            return id;
-        }
-    }
-    u64::MAX
-}
-
-// only the task that submitted a request may collect it
-fn complete(id: u64, out: u64) -> Option<usize> {
+    let (a, b, c, d) = (f.rdi, f.rsi, f.rdx, f.r10);
     let me = task::current();
-    for slot in reqs().iter_mut() {
-        if let Some(req) = slot {
-            if req.id == id && req.owner == me && req.ready_at <= task::ticks() {
-                if !paging::user_range_ok(paging::current(), out, req.len as u64) {
-                    return None;
-                }
-                let len = req.len;
-                let data = req.data;
-                *slot = None;
-                unsafe {
-                    core::ptr::copy_nonoverlapping(data.as_ptr(), out as *mut u8, len);
-                }
-                return Some(len);
+    f.rax = match f.rax {
+        SYS_PRINT => match user_bytes(a, b, PRINT_MAX) {
+            Some(bytes) => {
+                print!("{}", alloc::string::String::from_utf8_lossy(bytes));
+                0
             }
+            None => err(INVALID),
+        },
+        SYS_EXIT => exit_job(a),
+        SYS_YIELD => {
+            task::schedule();
+            0
         }
-    }
-    None
-}
-
-fn poll_now(id: u64, out: u64) -> u64 {
-    u64::from(complete(id, out).is_some())
-}
-
-fn wait(id: u64, out: u64) -> u64 {
-    let me = task::current();
-    loop {
-        if complete(id, out).is_some() {
-            return 1;
-        }
-        let now = task::ticks();
-        let mut seen = false;
-        let mut armed = false;
-        for slot in reqs().iter_mut() {
-            if let Some(req) = slot {
-                if req.id == id && req.owner == me {
-                    seen = true;
-                    if req.ready_at > now {
-                        req.waiter = true;
-                        armed = true;
+        SYS_TIME => clock::now_ns(),
+        SYS_SUBMIT => match user_bytes(c, d, PAYLOAD) {
+            Some(bytes) => match rpc::submit_user(a, b as u16, Body::bytes(bytes), rpc::Then::Task(me), timeout(f.r8)) {
+                Ok(id) => id,
+                Err(status) => err(status),
+            },
+            None => err(INVALID),
+        },
+        SYS_POLL => match rpc::take(a, me) {
+            Taken::Done(p) => done(b, p.status, &p.body),
+            Taken::Pending => PENDING,
+            Taken::Unknown => BAD_ID,
+        },
+        SYS_WAIT => match rpc::wait(a) {
+            Some(p) => done(b, p.status, &p.body),
+            None => BAD_ID,
+        },
+        SYS_LOOKUP => match user_bytes(a, b, 32) {
+            Some(name) => rpc::lookup(name).unwrap_or_else(err),
+            None => err(INVALID),
+        },
+        SYS_REGISTER => match user_bytes(a, b, 32) {
+            Some(name) => rpc::register_user(me, name).unwrap_or_else(err),
+            None => err(INVALID),
+        },
+        SYS_RECV => {
+            if rpc::handle_core(a) != smp::core() || !user_ok(b, PAYLOAD as u64) {
+                err(INVALID)
+            } else {
+                match rpc::svc_recv(a as u16, me) {
+                    Ok((token, op, body)) => {
+                        copy_out(b, &body);
+                        f.rdx = (op as u64) << 32 | body.len as u64;
+                        token
                     }
-                    break;
+                    Err(status) => err(status),
                 }
             }
         }
-        if !seen || !armed {
-            return u64::MAX;
+        SYS_REPLY => match user_bytes(c, d, PAYLOAD) {
+            Some(bytes) => match rpc::svc_reply(me, a, b as u8, Body::bytes(bytes)) {
+                Ok(()) => 0,
+                Err(status) => err(status),
+            },
+            None => err(INVALID),
+        },
+        SYS_INFO => {
+            f.rdx = current_pid();
+            smp::core() as u64
         }
-        task::block_current();
-    }
+        SYS_GROW => grow(a),
+        SYS_SLEEP => {
+            let ticks = a.div_ceil(clock::TICK_US * 1000);
+            task::sleep_until(task::ticks() + ticks);
+            0
+        }
+        _ => err(INVALID),
+    };
 }
 
-pub fn on_tick() {
-    let now = task::ticks();
-    for slot in reqs().iter_mut() {
-        if let Some(req) = slot {
-            if req.waiter && req.ready_at <= now {
-                req.waiter = false;
-                task::wake(req.owner);
-            }
-        }
+fn grow(pages: u64) -> u64 {
+    let tid = task::current();
+    let Some(mut p) = PROCS.with(|p| p[tid]) else {
+        return err(INVALID);
+    };
+    let start = p.heap_top;
+    let end = pages.checked_mul(PAGE).and_then(|n| n.checked_add(start));
+    if pages == 0 || end.is_none_or(|e| e > HEAP_BASE + HEAP_MAX) {
+        return err(INVALID);
     }
+    let pml4 = paging::current();
+    for i in 0..pages {
+        let Some(f) = frame::alloc_zeroed() else {
+            return err(NO_MEMORY);
+        };
+        unsafe { paging::map_4k(pml4, start + i * PAGE, f, USER | WRITABLE) };
+        p.heap_top += PAGE;
+        PROCS.with(|procs| procs[tid] = Some(p));
+    }
+    start
 }

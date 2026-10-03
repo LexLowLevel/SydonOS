@@ -1,0 +1,7 @@
+[package]
+name = "sydon-rt"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+freelist = { path = "../lib/freelist" }

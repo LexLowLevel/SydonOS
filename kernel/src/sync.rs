@@ -3,8 +3,7 @@ use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-// interrupts stay off while the lock is held. otherwise a handler or a
-// syscall on the same core could spin forever on a lock its own core holds.
+// interrupts stay off while held, or an irq on the same core could spin on it forever
 pub struct SpinLock<T> {
     locked: AtomicBool,
     data: UnsafeCell<T>,
@@ -59,5 +58,33 @@ impl<T> Drop for SpinGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.locked.store(false, Ordering::Release);
         cpu::pop_flags(self.flags);
+    }
+}
+
+pub struct IrqCell<T> {
+    busy: UnsafeCell<bool>,
+    data: UnsafeCell<T>,
+}
+
+unsafe impl<T: Send> Sync for IrqCell<T> {}
+
+impl<T> IrqCell<T> {
+    pub const fn new(data: T) -> Self {
+        IrqCell {
+            busy: UnsafeCell::new(false),
+            data: UnsafeCell::new(data),
+        }
+    }
+
+    pub fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        let flags = cpu::push_cli();
+        unsafe {
+            assert!(!*self.busy.get(), "IrqCell entered twice");
+            *self.busy.get() = true;
+            let out = f(&mut *self.data.get());
+            *self.busy.get() = false;
+            cpu::pop_flags(flags);
+            out
+        }
     }
 }

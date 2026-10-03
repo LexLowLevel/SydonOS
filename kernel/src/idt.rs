@@ -116,6 +116,93 @@ global_asm!(
     dispatch = sym interrupt_dispatch,
 );
 
+// syscall leaves the user rsp in place and the return address in rcx, so
+// this builds the same Frame an int 0x80 would. interrupts stay off until
+// the stack is ours.
+global_asm!(
+    ".global syscall_entry",
+    "syscall_entry:",
+    "mov [rip + {user_rsp}], rsp",
+    "mov rsp, [rip + {kernel_rsp}]",
+    "push {user_ds}",
+    "push [rip + {user_rsp}]",
+    "push r11",
+    "push {user_cs}",
+    "push rcx",
+    "push 0",
+    "push 128",
+    "push rax",
+    "push rbx",
+    "push rcx",
+    "push rdx",
+    "push rsi",
+    "push rdi",
+    "push rbp",
+    "push r8",
+    "push r9",
+    "push r10",
+    "push r11",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    "mov rdi, rsp",
+    "call {dispatch}",
+    "pop r15",
+    "pop r14",
+    "pop r13",
+    "pop r12",
+    "pop r11",
+    "pop r10",
+    "pop r9",
+    "pop r8",
+    "pop rbp",
+    "pop rdi",
+    "pop rsi",
+    "pop rdx",
+    "pop rcx",
+    "pop rbx",
+    "pop rax",
+    "add rsp, 16",
+    // sysret to a non-canonical rip faults in ring 0 on the user stack
+    "mov rcx, [rsp]",
+    "mov r11, rcx",
+    "shr r11, 47",
+    "jnz 2f",
+    "mov r11, [rsp + 16]",
+    "mov rsp, [rsp + 24]",
+    "sysretq",
+    "2:",
+    "iretq",
+    user_rsp = sym SYSCALL_USER_RSP,
+    kernel_rsp = sym crate::gdt::SYSCALL_RSP,
+    user_ds = const crate::gdt::USER_DS as u64,
+    user_cs = const crate::gdt::USER_CS as u64,
+    dispatch = sym interrupt_dispatch,
+);
+
+static mut SYSCALL_USER_RSP: u64 = 0;
+
+extern "C" {
+    fn syscall_entry();
+}
+
+const EFER: u32 = 0xC000_0080;
+const STAR: u32 = 0xC000_0081;
+const LSTAR: u32 = 0xC000_0082;
+const SFMASK: u32 = 0xC000_0084;
+// IF, TF, DF, NT and AC are clear on entry
+const SYSCALL_CLEARS: u64 = 0x200 | 0x100 | 0x400 | 0x4000 | 0x4_0000;
+
+fn init_syscall() {
+    // sysret takes ss from the STAR base + 8 and cs from base + 16
+    let star = (crate::gdt::USER_DS as u64 - 8) << 48 | (KERNEL_CS as u64) << 32;
+    cpu::wrmsr(STAR, star);
+    cpu::wrmsr(LSTAR, syscall_entry as usize as u64);
+    cpu::wrmsr(SFMASK, SYSCALL_CLEARS);
+    cpu::wrmsr(EFER, cpu::rdmsr(EFER) | 1);
+}
+
 extern "C" {
     static isr_stub_table: [u64; 36];
 }
@@ -185,6 +272,7 @@ pub fn init() {
         IDT[crate::fabric::DOORBELL_VEC as usize] = Gate::new(table[35], 0);
     }
     load();
+    init_syscall();
 }
 
 pub fn load() {
@@ -213,7 +301,7 @@ extern "C" fn interrupt_dispatch(frame: *mut Frame) {
     match f.vec {
         32 => {
             crate::apic::eoi();
-            crate::user::on_tick();
+            crate::rpc::on_tick();
             crate::fabric::on_tick();
             crate::task::on_timer();
         }
@@ -224,18 +312,23 @@ extern "C" fn interrupt_dispatch(frame: *mut Frame) {
         }
         128 => crate::user::syscall(f),
         255 => {}
-        // a fault in ring 3 ends that job, the core keeps going
         v if v < 32 && f.cs & 3 == 3 => crate::user::fault(f, NAMES[v as usize]),
         v if v < 32 => {
             let name = NAMES[v as usize];
             println!("exception {}: {} (err {:#x})", v, name, f.err);
             println!("  rip={:#x} cs={:#x} rflags={:#x}", f.rip, f.cs, f.rflags);
-            if v == 14 {
+            if v == 14 || v == 8 {
                 println!("  cr2={:#x}", cpu::read_cr2());
+            }
+            if let Some(t) = crate::task::overflowed(cpu::read_cr2()).filter(|_| v == 8 || v == 14) {
+                println!("  kernel stack overflow in task {}", t);
             }
             cpu::cli();
             cpu::hlt_loop();
         }
         _ => {}
+    }
+    if f.cs & 3 == 3 && crate::task::killed() {
+        crate::user::exit_job(crate::user::KILLED_CODE);
     }
 }

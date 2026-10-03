@@ -63,8 +63,6 @@ impl FrameAlloc {
         None
     }
 
-    // single frames go on a stack linked through the frames themselves.
-    // bigger blocks become their own range and are never merged.
     fn free(&mut self, base: u64, frames: u64) {
         if frames == 1 {
             unsafe { (phys_to_virt(base) as *mut u64).write(self.single) };
@@ -94,7 +92,6 @@ pub fn init(bi: &BootInfo) {
             continue;
         }
         f.top = f.top.max(end);
-        // skip the kernel image if it overlaps this range
         if k1 > start && k0 < end {
             if k0 > start {
                 f.insert(start, (k0.min(end) - start) / FRAME);

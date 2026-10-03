@@ -1,0 +1,11 @@
+[package]
+name = "job-flood"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "job-flood"
+path = "src/main.rs"
+
+[dependencies]
+sydon-rt = { path = "../../rt" }

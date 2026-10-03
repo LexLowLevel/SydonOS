@@ -1,6 +1,6 @@
 use crate::acpi::MAX_CPUS;
 use crate::fabric::{self, Msg};
-use crate::{cpu, pit, smp, task};
+use crate::{clock, cpu, smp};
 use alloc::vec::Vec;
 
 const STRESS: u64 = 1;
@@ -10,18 +10,25 @@ const PONG: u64 = 4;
 const MODE: u64 = 5;
 const FLOOD: u64 = 6;
 const FLOOD_DONE: u64 = 7;
-const STOP: u64 = 8;
+const GO: u64 = 8;
+const START: u64 = 9;
+const REPORT: u64 = 10;
+const DATA: u64 = 11;
+
+const PAIRS: u64 = 1;
+const ALL: u64 = 2;
+const PAIR_MSGS: u64 = 2_000_000;
+const ALL_MSGS: u64 = 300_000;
 
 const STRESS_PER_PEER: u64 = 2000;
 const RTT_ROUNDS: usize = 10_000;
 const DOORBELL_ROUNDS: usize = 1000;
-const FLOOD_MSGS: u64 = 100_000;
+const FLOOD_MSGS: u64 = 1_000_000;
+const BATCH: usize = 32;
 
-pub fn spawn() {
-    task::spawn(run, 0).expect("ringtest: no room for its task");
-}
-
-fn run(_: u64) {
+// no core leaves before core 0 says GO, so nothing else can land in a ring
+// while the test still reads it
+pub fn run() {
     let me = smp::core();
     let cores = fabric::cores();
     if cores < 2 {
@@ -29,10 +36,162 @@ fn run(_: u64) {
     }
     stress(me, cores);
     match me {
-        0 => bench(),
+        0 => {
+            bench();
+            scaling(cores);
+            for c in 1..cores {
+                fabric::send(c, &msg(GO, 0, 0), unexpected);
+            }
+        }
         1 => respond(),
-        _ => {}
+        _ => wait_go(),
     }
+}
+
+// data can beat the START that announced it: peers start sending as soon as
+// their own START lands, and it travels on a different ring
+fn wait_go() {
+    let mut early = 0;
+    loop {
+        match fabric::poll() {
+            Some((_, m)) if m.0[0] == GO => return,
+            Some((_, m)) if m.0[0] == DATA => early += 1,
+            Some((_, m)) if m.0[0] == START => {
+                phase(m.0[1], early);
+                early = 0;
+            }
+            Some((src, m)) => unexpected(src, m),
+            None => fabric::wait(true),
+        }
+    }
+}
+
+fn phase(which: u64, early: u64) {
+    let (me, cores) = (smp::core(), fabric::cores());
+    let report = match which {
+        PAIRS => pairs_role(me, cores, early),
+        _ => Some(all_role(me, cores, &mut Vec::new(), early)),
+    };
+    if let Some((cycles, msgs)) = report {
+        fabric::send(0, &msg(REPORT, cycles, msgs), unexpected);
+    }
+}
+
+fn stream_to(dst: usize, count: u64) {
+    let burst = [msg(DATA, 0, 0); BATCH];
+    let mut sent = 0;
+    while sent < count {
+        let k = (count - sent).min(BATCH as u64) as usize;
+        let n = fabric::push_burst(dst, &burst[..k]);
+        if n == 0 {
+            core::hint::spin_loop();
+        }
+        sent += n as u64;
+    }
+}
+
+// the receiver times from its first message, so start skew between pairs does not count
+fn pairs_role(me: usize, cores: usize, early: u64) -> Option<(u64, u64)> {
+    if me % 2 == 0 {
+        if me + 1 < cores {
+            stream_to(me + 1, PAIR_MSGS);
+        }
+        return None;
+    }
+    let mut batch = [(0, Msg([0; 7])); BATCH];
+    let mut got = early;
+    let mut t0 = if early > 0 { cpu::rdtsc() } else { 0 };
+    while got < PAIR_MSGS {
+        let n = fabric::poll_many(&mut batch);
+        if n > 0 && got == 0 {
+            t0 = cpu::rdtsc();
+        }
+        for &(src, m) in &batch[..n] {
+            if m.0[0] != DATA {
+                unexpected(src, m);
+            }
+        }
+        got += n as u64;
+    }
+    Some((cpu::rdtsc() - t0, got))
+}
+
+fn all_role(me: usize, cores: usize, early: &mut Vec<(u64, u64)>, early_data: u64) -> (u64, u64) {
+    let t0 = cpu::rdtsc();
+    let mut sent = [0u64; MAX_CPUS];
+    let mut got = early_data;
+    let want = ALL_MSGS * (cores as u64 - 1);
+    let burst = [msg(DATA, 0, 0); BATCH];
+    let mut batch = [(0, Msg([0; 7])); BATCH];
+    while got < want || (0..cores).any(|p| p != me && sent[p] < ALL_MSGS) {
+        for p in 0..cores {
+            if p != me && sent[p] < ALL_MSGS {
+                let k = (ALL_MSGS - sent[p]).min(BATCH as u64) as usize;
+                sent[p] += fabric::push_burst(p, &burst[..k]) as u64;
+            }
+        }
+        // take about as much as was just sent, or the rings fill up
+        for _ in 1..cores {
+            let n = fabric::poll_many(&mut batch);
+            for &(src, m) in &batch[..n] {
+                match m.0[0] {
+                    DATA => got += 1,
+                    REPORT if me == 0 => early.push((m.0[1], m.0[2])),
+                    _ => unexpected(src, m),
+                }
+            }
+            if n == 0 {
+                break;
+            }
+        }
+    }
+    (cpu::rdtsc() - t0, got)
+}
+
+fn collect(want: usize, mut reports: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    while reports.len() < want {
+        match fabric::poll() {
+            Some((_, m)) if m.0[0] == REPORT => reports.push((m.0[1], m.0[2])),
+            Some((src, m)) => unexpected(src, m),
+            None => core::hint::spin_loop(),
+        }
+    }
+    reports
+}
+
+fn scaling(cores: usize) {
+    let rate = |cycles: u64, msgs: u64| msgs * clock::tsc_per_ms() * 1000 / cycles.max(1);
+
+    let pairs = cores / 2;
+    for c in 1..cores {
+        fabric::send(c, &msg(START, PAIRS, 0), unexpected);
+    }
+    stream_to(1, PAIR_MSGS);
+    let reports = collect(pairs, Vec::new());
+    let total: u64 = reports.iter().map(|&(c, m)| rate(c, m)).sum();
+    println!(
+        "ringtest: {} parallel streams: {} M msgs/s total, {} M per stream",
+        pairs,
+        total / 1_000_000,
+        total / pairs as u64 / 1_000_000
+    );
+
+    for c in 1..cores {
+        fabric::send(c, &msg(START, ALL, 0), unexpected);
+    }
+    let mut early = Vec::new();
+    let mine = all_role(0, cores, &mut early, 0);
+    let mut reports = collect(cores - 1, early);
+    reports.push(mine);
+    let slowest = reports.iter().map(|&(c, _)| c).max().unwrap_or(1);
+    let msgs: u64 = reports.iter().map(|&(_, m)| m).sum();
+    let total = rate(slowest, msgs);
+    println!(
+        "ringtest: all-to-all on {} cores: {} M msgs/s total, {} M per core",
+        cores,
+        total / 1_000_000,
+        total / cores as u64 / 1_000_000
+    );
 }
 
 fn msg(kind: u64, a: u64, b: u64) -> Msg {
@@ -73,8 +232,7 @@ impl Stress {
     }
 }
 
-// every core sends to every other core at once. 64 slots per ring against
-// thousands of messages keeps the full-ring path busy the whole time.
+// 64 slots per ring against thousands of messages keeps the full-ring path busy
 fn stress(me: usize, cores: usize) {
     let mut st = Stress { me, next: [0; MAX_CPUS], done: 0 };
     for n in 0..STRESS_PER_PEER {
@@ -86,7 +244,7 @@ fn stress(me: usize, cores: usize) {
     while !finished(&st) {
         match fabric::poll() {
             Some((src, m)) => st.take(src, m),
-            None => fabric::wait(),
+            None => fabric::wait(true),
         }
     }
     if me == 0 {
@@ -100,27 +258,40 @@ fn stress(me: usize, cores: usize) {
 fn respond() {
     let mut sleepy = false;
     let mut flood = 0;
+    let mut early = 0;
+    let mut batch = [(0, Msg([0; 7])); BATCH];
     loop {
-        let Some((src, m)) = fabric::poll() else {
+        let n = fabric::poll_many(&mut batch);
+        if n == 0 {
             if sleepy {
-                fabric::wait();
+                fabric::wait(true);
             } else {
                 core::hint::spin_loop();
             }
             continue;
-        };
-        match m.0[0] {
-            PING => fabric::send(src, &msg(PONG, m.0[1], 0), unexpected),
-            MODE => sleepy = m.0[1] != 0,
-            FLOOD => {
-                flood += 1;
-                if flood == m.0[2] {
-                    flood = 0;
-                    fabric::send(src, &msg(FLOOD_DONE, 0, 0), unexpected);
+        }
+        for (i, &(src, m)) in batch[..n].iter().enumerate() {
+            match m.0[0] {
+                PING => fabric::send(src, &msg(PONG, m.0[1], 0), unexpected),
+                MODE => sleepy = m.0[1] != 0,
+                FLOOD => {
+                    flood += 1;
+                    if flood == m.0[2] {
+                        flood = 0;
+                        fabric::send(src, &msg(FLOOD_DONE, 0, 0), unexpected);
+                    }
                 }
+                GO => return,
+                DATA => early += 1,
+                // the rest of this batch is data for the phase that starts now
+                START => {
+                    early += batch[i + 1..n].iter().filter(|b| b.1 .0[0] == DATA).count() as u64;
+                    phase(m.0[1], early);
+                    early = 0;
+                    break;
+                }
+                _ => unexpected(src, m),
             }
-            STOP => return,
-            _ => unexpected(src, m),
         }
     }
 }
@@ -153,9 +324,7 @@ fn round_trips(rounds: usize, wait_for_sleep: bool) -> Vec<u64> {
 }
 
 fn bench() {
-    let t0 = cpu::rdtsc();
-    pit::sleep_us(10_000);
-    let tsc_per_ms = (cpu::rdtsc() - t0) / 10;
+    let tsc_per_ms = clock::tsc_per_ms();
     let ns = |cycles: u64| cycles * 1_000_000 / tsc_per_ms;
 
     let report = |name: &str, s: &[u64]| {
@@ -176,8 +345,22 @@ fn bench() {
     fabric::send(1, &msg(MODE, 0, 0), unexpected);
 
     let t0 = cpu::rdtsc();
-    for i in 0..FLOOD_MSGS {
-        fabric::send(1, &msg(FLOOD, i, FLOOD_MSGS), unexpected);
+    let mut burst = [Msg([0; 7]); BATCH];
+    let mut i = 0;
+    while i < FLOOD_MSGS {
+        let k = (FLOOD_MSGS - i).min(BATCH as u64) as usize;
+        for (j, m) in burst[..k].iter_mut().enumerate() {
+            *m = msg(FLOOD, i + j as u64, FLOOD_MSGS);
+        }
+        let mut sent = 0;
+        while sent < k {
+            let n = fabric::push_burst(1, &burst[sent..k]);
+            if n == 0 {
+                core::hint::spin_loop();
+            }
+            sent += n;
+        }
+        i += k as u64;
     }
     let m = recv_from(1);
     assert!(m.0[0] == FLOOD_DONE, "ringtest: bad flood reply {:?}", m);
@@ -188,6 +371,4 @@ fn bench() {
         elapsed / 1000,
         FLOOD_MSGS * 1_000_000_000 / elapsed
     );
-
-    fabric::send(1, &msg(STOP, 0, 0), unexpected);
 }

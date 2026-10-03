@@ -42,6 +42,15 @@ pub fn cli() {
     }
 }
 
+// sti only takes effect after the next instruction, so no interrupt can
+// slip in between it and hlt
+#[inline]
+pub fn sti_hlt() {
+    unsafe {
+        asm!("sti", "hlt", options(nostack, preserves_flags))
+    }
+}
+
 #[inline]
 pub fn sti() {
     unsafe {
@@ -59,11 +68,19 @@ pub fn push_cli() -> u64 {
     flags
 }
 
+// only IF can differ, and popf costs far more than sti
 #[inline]
 pub fn pop_flags(flags: u64) {
-    unsafe {
-        asm!("push {}", "popfq", in(reg) flags)
+    if flags & 0x200 != 0 {
+        unsafe { asm!("sti", options(nostack)) }
     }
+}
+
+// the same ordering as mfence for the store-then-load cases here, at about
+// half the cost on x86
+#[inline(always)]
+pub fn full_fence() {
+    unsafe { asm!("lock or qword ptr [rsp], 0") }
 }
 
 #[inline]
@@ -134,3 +151,5 @@ pub unsafe fn lidt(desc: &DescriptorTablePointer) {
 pub unsafe fn ltr(sel: u16) {
     asm!("ltr {0:x}", in(reg) sel, options(nostack, preserves_flags));
 }
+
+

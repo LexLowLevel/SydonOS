@@ -1,7 +1,6 @@
 use crate::cpu;
 use crate::gdt;
-use alloc::alloc::{alloc_zeroed, dealloc};
-use core::alloc::Layout;
+use crate::{frame, paging};
 use core::arch::global_asm;
 use core::ptr;
 use core::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -9,8 +8,12 @@ use core::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 pub type Entry = fn(u64);
 
 const STACK_SIZE: usize = 32 * 1024;
+// each slot leaves the space below its stack unmapped, so an overflow faults
+// instead of writing over whatever lies next to it
+const STACKS: u64 = 0xFFFF_FFFF_0000_0000;
+const STACK_STRIDE: u64 = 2 * STACK_SIZE as u64;
+const PAGE: u64 = 0x1000;
 pub const MAX_TASKS: usize = 32;
-// the boot stack; it runs whenever no task is ready
 pub const IDLE: usize = usize::MAX;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -41,7 +44,11 @@ struct Task {
     arg: u64,
     entry: Entry,
     state: AtomicU8,
+    system: bool,
     cr3: u64,
+    wake_at: u64,
+    kill: bool,
+    boost: bool,
 }
 
 fn dummy(_: u64) {}
@@ -52,7 +59,11 @@ const TASK_EMPTY: Task = Task {
     arg: 0,
     entry: dummy,
     state: AtomicU8::new(State::Empty as u8),
+    system: false,
     cr3: 0,
+    wake_at: 0,
+    kill: false,
+    boost: false,
 };
 
 static mut TABLE: [Task; MAX_TASKS] = [TASK_EMPTY; MAX_TASKS];
@@ -65,8 +76,6 @@ extern "C" {
     static __stack_top: u8;
 }
 
-// saves callee-saved registers on the old stack and stores rsp in *old, then
-// loads the new rsp and pops. ret goes wherever that task last switched out.
 global_asm!(
     ".global task_switch",
     "task_switch:",
@@ -115,15 +124,12 @@ extern "C" fn task_root() {
     exit_current();
 }
 
-// a finished task still owns its kernel stack and maybe an address space.
-// both are freed here, when the slot is reused, because a task cannot free
-// the stack it is running on.
+// a task cannot free the stack it runs on, so this happens later
 unsafe fn reap(t: *mut Task) {
-    let layout = Layout::from_size_align(STACK_SIZE, 16).unwrap();
-    dealloc((*t).stack, layout);
+    free_stack((*t).stack as u64);
     let kernel = KERNEL_CR3.load(Ordering::Relaxed);
     if (*t).cr3 != kernel {
-        // kernel tasks borrow whatever space was loaded, which may be this one
+        // a kernel task may still run on this space
         if crate::paging::current() == (*t).cr3 {
             cpu::write_cr3(kernel);
         }
@@ -132,21 +138,21 @@ unsafe fn reap(t: *mut Task) {
     set_state(t, State::Empty);
 }
 
-pub fn spawn(entry: Entry, arg: u64) -> Option<usize> {
-    spawn_in(entry, arg, KERNEL_CR3.load(Ordering::Relaxed))
+pub fn spawn(entry: Entry, arg: u64, system: bool) -> Option<usize> {
+    spawn_in(entry, arg, system, KERNEL_CR3.load(Ordering::Relaxed))
 }
 
-pub fn spawn_in(entry: Entry, arg: u64, cr3: u64) -> Option<usize> {
+pub fn spawn_in(entry: Entry, arg: u64, system: bool, cr3: u64) -> Option<usize> {
     let flags = cpu::push_cli();
     let Some(i) = take_slot() else {
         cpu::pop_flags(flags);
         return None;
     };
-    let stack = unsafe { alloc_zeroed(Layout::from_size_align(STACK_SIZE, 16).unwrap()) };
-    if stack.is_null() {
+    let Some(stack) = map_stack(i) else {
         cpu::pop_flags(flags);
         return None;
-    }
+    };
+    let stack = stack as *mut u8;
     unsafe {
         let t = task_at(i);
         // fake a task_switch frame: six zeroed registers, then task_root to ret into
@@ -162,7 +168,11 @@ pub fn spawn_in(entry: Entry, arg: u64, cr3: u64) -> Option<usize> {
         (*t).stack = stack;
         (*t).arg = arg;
         (*t).entry = entry;
+        (*t).system = system;
         (*t).cr3 = cr3;
+        (*t).wake_at = 0;
+        (*t).kill = false;
+        (*t).boost = false;
         set_state(t, State::Ready);
     }
     cpu::pop_flags(flags);
@@ -187,6 +197,25 @@ fn take_slot() -> Option<usize> {
     Some(i)
 }
 
+pub fn reap_finished() {
+    let flags = cpu::push_cli();
+    let cur = CURRENT.load(Ordering::Relaxed);
+    for i in (0..MAX_TASKS).filter(|&i| i != cur) {
+        unsafe {
+            let t = task_at(i);
+            if get_state(t) == State::Done {
+                reap(t);
+            }
+        }
+    }
+    cpu::pop_flags(flags);
+}
+
+pub fn others_ready() -> bool {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    (0..MAX_TASKS).any(|i| i != cur && unsafe { get_state(task_at(i)) } == State::Ready)
+}
+
 pub fn current() -> usize {
     CURRENT.load(Ordering::Relaxed)
 }
@@ -195,9 +224,29 @@ pub fn wake(i: usize) {
     unsafe {
         let t = task_at(i);
         if get_state(t) == State::Blocked {
+            (*t).wake_at = 0;
+            (*t).boost = true;
             set_state(t, State::Ready);
         }
     }
+}
+
+// takes effect on the next return to ring 3
+pub fn kill(i: usize) {
+    let flags = cpu::push_cli();
+    unsafe {
+        let t = task_at(i);
+        if matches!(get_state(t), State::Ready | State::Running | State::Blocked) {
+            (*t).kill = true;
+            wake(i);
+        }
+    }
+    cpu::pop_flags(flags);
+}
+
+pub fn killed() -> bool {
+    let cur = CURRENT.load(Ordering::Relaxed);
+    cur != IDLE && unsafe { (*task_at(cur)).kill }
 }
 
 pub fn block_current() {
@@ -208,6 +257,18 @@ pub fn block_current() {
         }
     }
     schedule();
+}
+
+pub fn sleep_until(tick: u64) {
+    let flags = cpu::push_cli();
+    let cur = CURRENT.load(Ordering::Relaxed);
+    if cur != IDLE && tick > ticks() {
+        unsafe {
+            (*task_at(cur)).wake_at = tick;
+        }
+        block_current();
+    }
+    cpu::pop_flags(flags);
 }
 
 pub fn exit_current() -> ! {
@@ -223,6 +284,35 @@ pub fn exit_current() -> ! {
     }
 }
 
+fn map_stack(i: usize) -> Option<u64> {
+    let base = STACKS + i as u64 * STACK_STRIDE + STACK_STRIDE - STACK_SIZE as u64;
+    let kernel = KERNEL_CR3.load(Ordering::Relaxed);
+    for page in (0..STACK_SIZE as u64).step_by(PAGE as usize) {
+        let Some(f) = frame::alloc_zeroed() else {
+            free_stack(base);
+            return None;
+        };
+        unsafe { paging::map_4k(kernel, base + page, f, paging::WRITABLE) };
+    }
+    Some(base)
+}
+
+fn free_stack(base: u64) {
+    let kernel = KERNEL_CR3.load(Ordering::Relaxed);
+    for page in (0..STACK_SIZE as u64).step_by(PAGE as usize) {
+        if let Some(f) = paging::translate(kernel, base + page) {
+            unsafe { paging::unmap_4k(kernel, base + page) };
+            frame::free(f, 1);
+        }
+    }
+}
+
+pub fn overflowed(addr: u64) -> Option<usize> {
+    let i = addr.checked_sub(STACKS)? / STACK_STRIDE;
+    let guard = addr.checked_sub(STACKS)? % STACK_STRIDE < STACK_STRIDE - STACK_SIZE as u64;
+    (i < MAX_TASKS as u64 && guard).then_some(i as usize)
+}
+
 fn kstack_top(i: usize) -> u64 {
     if i == IDLE {
         ptr::addr_of!(__stack_top) as u64
@@ -231,12 +321,15 @@ fn kstack_top(i: usize) -> u64 {
     }
 }
 
-// round robin, starting after the current task
 fn pick(cur: usize) -> Option<usize> {
     let start = if cur == IDLE { 0 } else { cur + 1 };
-    (0..MAX_TASKS)
-        .map(|k| (start + k) % MAX_TASKS)
-        .find(|&i| unsafe { get_state(task_at(i)) == State::Ready })
+    let ready = |i: usize| unsafe { get_state(task_at(i)) == State::Ready };
+    let order = (0..MAX_TASKS).map(|k| (start + k) % MAX_TASKS);
+    order
+        .clone()
+        .find(|&i| ready(i) && unsafe { (*task_at(i)).system })
+        .or_else(|| order.clone().find(|&i| ready(i) && unsafe { (*task_at(i)).boost }))
+        .or_else(|| order.clone().find(|&i| ready(i)))
 }
 
 pub fn schedule() {
@@ -248,7 +341,14 @@ pub fn schedule() {
         unsafe { get_state(task_at(cur)) }
     };
     let cur_inactive = cur_state == State::Done || cur_state == State::Blocked;
+    let cur_system = cur != IDLE && unsafe { (*task_at(cur)).system };
+
     let next = pick(cur);
+    // a running system task is not preempted by a job
+    let next = match next {
+        Some(n) if cur_system && !cur_inactive && !unsafe { (*task_at(n)).system } => None,
+        n => n,
+    };
 
     if next.is_none() && !cur_inactive {
         cpu::pop_flags(flags);
@@ -270,10 +370,8 @@ pub fn schedule() {
             set_state(task_at(n), State::Running);
         }
     }
-    // the stack the cpu lands on when this task traps out of ring 3
     gdt::set_rsp0(kstack_top(target));
-    // the kernel half is the same in every space, so kernel tasks and idle
-    // just keep the current one and skip the tlb flush
+    // kernel tasks and idle keep the current space: same kernel half, no tlb flush
     let kernel = KERNEL_CR3.load(Ordering::Relaxed);
     let cr3 = if target == IDLE { kernel } else { unsafe { (*task_at(target)).cr3 } };
     if cr3 != kernel && cr3 != crate::paging::current() {
@@ -292,24 +390,23 @@ pub fn schedule() {
 }
 
 pub fn on_timer() {
-    TICKS.fetch_add(1, Ordering::Relaxed);
+    let now = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+    let cur = CURRENT.load(Ordering::Relaxed);
+    if cur != IDLE {
+        unsafe { (*task_at(cur)).boost = false };
+    }
+    for i in 0..MAX_TASKS {
+        unsafe {
+            let t = task_at(i);
+            if (*t).wake_at != 0 && (*t).wake_at <= now && get_state(t) == State::Blocked {
+                (*t).wake_at = 0;
+                set_state(t, State::Ready);
+            }
+        }
+    }
     schedule();
 }
 
 pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
-}
-
-pub fn all_done() -> bool {
-    let mut any = false;
-    unsafe {
-        for i in 0..MAX_TASKS {
-            match get_state(task_at(i)) {
-                State::Empty => {}
-                State::Done => any = true,
-                _ => return false,
-            }
-        }
-    }
-    any
 }

@@ -133,8 +133,6 @@ pub fn translate(pml4: u64, virt: u64) -> Option<u64> {
     }
 }
 
-// kernel half: physmap of the low 4 GiB and all ram, the kernel image
-// backed by image_phys, and the lapic window
 pub fn build_kernel_space(image_phys: u64) -> u64 {
     let pml4 = frame::alloc_zeroed().expect("paging: no pml4");
     let (start, end) = image_bounds();
@@ -203,8 +201,7 @@ fn leaf(pml4: u64, virt: u64) -> Option<u64> {
     }
 }
 
-// frees every page and table in the lower half, then the pml4 itself.
-// the upper half belongs to the kernel and is only borrowed.
+// the upper half belongs to the kernel and is only borrowed
 pub fn free_user_space(pml4: u64) {
     unsafe fn free_level(table: u64, level: u32) {
         for i in 0..512 {

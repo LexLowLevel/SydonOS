@@ -57,7 +57,6 @@ stage1_start:
     mov [BOOTINFO + 24], eax
     mov dword [BOOTINFO + 28], 0
 
-    ; E820 memory map straight into BootInfo, 24 bytes per entry
     xor bp, bp
     mov di, BOOTINFO + 32
     xor ebx, ebx
@@ -275,8 +274,6 @@ lm_entry:
     mov esp, 0x7C00
     PUTC 'L'
 
-    ; copy each PT_LOAD to its physical address (p_paddr, or p_vaddr if
-    ; that is 0) and zero the bss tail
     mov rsi, KERN_BUF
     cmp dword [rsi], 0x464C457F
     jne elf_bad

@@ -3,8 +3,50 @@
 version = 4
 
 [[package]]
+name = "freelist"
+version = "0.1.0"
+
+[[package]]
+name = "job-echod"
+version = "0.1.0"
+dependencies = [
+ "sydon-rt",
+]
+
+[[package]]
+name = "job-fault"
+version = "0.1.0"
+dependencies = [
+ "sydon-rt",
+]
+
+[[package]]
+name = "job-flood"
+version = "0.1.0"
+dependencies = [
+ "sydon-rt",
+]
+
+[[package]]
 name = "job-hello"
 version = "0.1.0"
+dependencies = [
+ "sydon-rt",
+]
+
+[[package]]
+name = "job-ping"
+version = "0.1.0"
+dependencies = [
+ "sydon-rt",
+]
+
+[[package]]
+name = "job-ticker"
+version = "0.1.0"
+dependencies = [
+ "sydon-rt",
+]
 
 [[package]]
 name = "mkimage"
@@ -13,3 +55,13 @@ version = "0.1.0"
 [[package]]
 name = "sydon-kernel"
 version = "0.1.0"
+dependencies = [
+ "freelist",
+]
+
+[[package]]
+name = "sydon-rt"
+version = "0.1.0"
+dependencies = [
+ "freelist",
+]

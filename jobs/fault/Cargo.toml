@@ -1,0 +1,11 @@
+[package]
+name = "job-fault"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "job-fault"
+path = "src/main.rs"
+
+[dependencies]
+sydon-rt = { path = "../../rt" }

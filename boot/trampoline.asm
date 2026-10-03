@@ -53,6 +53,7 @@ pm_entry:
     jmp 0x08:lm_entry
 
 BITS 64
+DEFAULT ABS
 lm_entry:
     xor eax, eax
     mov fs, ax
