@@ -6,7 +6,7 @@ use crate::paging::{self, phys_to_virt, USER, WRITABLE};
 use crate::rpc::{self, Answer, Body, Taken, BUSY, INVALID, NOT_FOUND, NO_MEMORY, OK, PAYLOAD};
 use crate::sync::IrqCell;
 use crate::task::{self, MAX_TASKS};
-use crate::{clock, jobs, smp};
+use crate::{clock, console, jobs, smp};
 use alloc::boxed::Box;
 
 const SYS_PRINT: u64 = 0;
@@ -46,6 +46,7 @@ struct Launch {
 struct Proc {
     pid: u64,
     heap_top: u64,
+    privileged: bool,
 }
 
 static PROCS: IrqCell<[Option<Proc>; MAX_TASKS]> = IrqCell::new([None; MAX_TASKS]);
@@ -58,20 +59,20 @@ pub fn load_job(pid: u64, name: &[u8]) -> Answer {
     let Some(b) = jobs::builtin(name) else {
         return Answer::Reply(NOT_FOUND, Body::EMPTY);
     };
-    match spawn_image(pid, b.image) {
+    match spawn_image(pid, b.image, b.privileged) {
         Ok(()) => Answer::Reply(OK, Body::EMPTY),
         Err(status) => Answer::Reply(status, Body::EMPTY),
     }
 }
 
-fn spawn_image(pid: u64, image: &[u8]) -> Result<(), u8> {
+fn spawn_image(pid: u64, image: &[u8], privileged: bool) -> Result<(), u8> {
     let (pml4, launch) = load(image)?;
     let arg = Box::into_raw(Box::new(launch));
     // the job must not run before its Proc exists
     let flags = crate::cpu::push_cli();
     let tid = task::spawn_in(run, arg as u64, false, pml4);
     if let Some(tid) = tid {
-        PROCS.with(|p| p[tid] = Some(Proc { pid, heap_top: HEAP_BASE }));
+        PROCS.with(|p| p[tid] = Some(Proc { pid, heap_top: HEAP_BASE, privileged }));
     }
     crate::cpu::pop_flags(flags);
     if tid.is_none() {
@@ -176,6 +177,10 @@ fn current_pid() -> u64 {
     PROCS.with(|p| p[task::current()].map_or(0, |p| p.pid))
 }
 
+fn privileged() -> bool {
+    PROCS.with(|p| p[task::current()].is_some_and(|p| p.privileged))
+}
+
 pub fn kill(pid: u64) -> bool {
     let tid = PROCS.with(|p| p.iter().position(|p| p.is_some_and(|p| p.pid == pid)));
     if let Some(tid) = tid {
@@ -250,9 +255,14 @@ pub fn syscall(f: &mut Frame) {
     let (a, b, c, d) = (f.rdi, f.rsi, f.rdx, f.r10);
     let me = task::current();
     f.rax = match f.rax {
+        // through the console, so job output and line editing do not mix
         SYS_PRINT => match user_bytes(a, b, PRINT_MAX) {
+            Some(bytes) if smp::core() == 0 => {
+                console::write(bytes);
+                0
+            }
             Some(bytes) => {
-                print!("{}", alloc::string::String::from_utf8_lossy(bytes));
+                console::print_remote(bytes);
                 0
             }
             None => err(INVALID),
@@ -264,7 +274,7 @@ pub fn syscall(f: &mut Frame) {
         }
         SYS_TIME => clock::now_ns(),
         SYS_SUBMIT => match user_bytes(c, d, PAYLOAD) {
-            Some(bytes) => match rpc::submit_user(a, b as u16, Body::bytes(bytes), rpc::Then::Task(me), timeout(f.r8)) {
+            Some(bytes) => match rpc::submit_user(a, b as u16, Body::bytes(bytes), rpc::Then::Task(me), timeout(f.r8), privileged()) {
                 Ok(id) => id,
                 Err(status) => err(status),
             },

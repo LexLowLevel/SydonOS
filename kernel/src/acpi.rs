@@ -3,11 +3,27 @@ use crate::paging::phys_to_virt;
 pub const MAX_CPUS: usize = 64;
 
 const MADT_LAPIC: u8 = 0;
+const MADT_IOAPIC: u8 = 1;
+const MADT_OVERRIDE: u8 = 2;
 const LAPIC_ENABLED: u32 = 1;
 
 pub struct Cpus {
     pub apic_ids: [u8; MAX_CPUS],
     pub count: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct IsaIrq {
+    pub gsi: u32,
+    pub active_low: bool,
+    pub level: bool,
+}
+
+pub struct Madt {
+    pub cpus: Cpus,
+    pub ioapic_phys: u64,
+    pub ioapic_gsi_base: u32,
+    pub isa: [IsaIrq; 16],
 }
 
 unsafe fn rd<T: Copy>(phys: u64) -> T {
@@ -58,12 +74,15 @@ fn find_table(sig: &[u8; 4]) -> Option<u64> {
     None
 }
 
-pub fn cpus() -> Cpus {
+pub fn madt() -> Madt {
     let madt = find_table(b"APIC").expect("acpi: no MADT");
-    let mut cpus = Cpus {
-        apic_ids: [0; MAX_CPUS],
-        count: 0,
+    let mut out = Madt {
+        cpus: Cpus { apic_ids: [0; MAX_CPUS], count: 0 },
+        ioapic_phys: 0,
+        ioapic_gsi_base: 0,
+        isa: core::array::from_fn(|i| IsaIrq { gsi: i as u32, active_low: false, level: false }),
     };
+    let cpus = &mut out.cpus;
     unsafe {
         let end = madt + rd::<u32>(madt + 4) as u64;
         let mut p = madt + 44;
@@ -79,8 +98,24 @@ pub fn cpus() -> Cpus {
                 cpus.apic_ids[cpus.count] = rd::<u8>(p + 3);
                 cpus.count += 1;
             }
+            if rd::<u8>(p) == MADT_IOAPIC && out.ioapic_phys == 0 {
+                out.ioapic_phys = rd::<u32>(p + 4) as u64;
+                out.ioapic_gsi_base = rd::<u32>(p + 8);
+            }
+            // flags: bits 0-1 polarity (3 = low), bits 2-3 trigger (3 = level)
+            if rd::<u8>(p) == MADT_OVERRIDE {
+                let irq = rd::<u8>(p + 3) as usize;
+                let flags = rd::<u16>(p + 8);
+                if irq < 16 {
+                    out.isa[irq] = IsaIrq {
+                        gsi: rd::<u32>(p + 4),
+                        active_low: flags & 3 == 3,
+                        level: (flags >> 2) & 3 == 3,
+                    };
+                }
+            }
             p += len;
         }
     }
-    cpus
+    out
 }

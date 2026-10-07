@@ -4,11 +4,14 @@ members = [
     "lib/freelist",
     "rt",
     "jobs/hello",
+    "jobs/shell",
     "jobs/echod",
     "jobs/ping",
     "jobs/ticker",
     "jobs/fault",
     "jobs/flood",
+    "jobs/kv",
+    "jobs/kvbench",
     "tools/mkimage",
 ]
 resolver = "2"

@@ -9,7 +9,7 @@ nasm -f bin boot/stage1.asm -o out/stage1.bin
 nasm -f bin boot/trampoline.asm -o out/trampoline.bin
 
 # the jobs are built into the kernel image, so they come first
-for job in hello echod ping ticker fault flood; do
+for job in shell hello echod ping ticker fault flood kv kvbench; do
     set -- "$@" -p "job-$job"
 done
 cargo build --release --target x86_64-unknown-none "$@"

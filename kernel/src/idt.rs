@@ -61,6 +61,7 @@ global_asm!(
     "ISR_NOERR 255",
     "ISR_NOERR 128",
     "ISR_NOERR 64",
+    "ISR_NOERR 36",
     ".global isr_common",
     "isr_common:",
     "push rax",
@@ -112,6 +113,7 @@ global_asm!(
     ".quad isr255",
     ".quad isr128",
     ".quad isr64",
+    ".quad isr36",
     ".text",
     dispatch = sym interrupt_dispatch,
 );
@@ -204,7 +206,7 @@ fn init_syscall() {
 }
 
 extern "C" {
-    static isr_stub_table: [u64; 36];
+    static isr_stub_table: [u64; 37];
 }
 
 #[repr(C, packed)]
@@ -270,6 +272,7 @@ pub fn init() {
         }
         IDT[0x80] = Gate::user(table[34]);
         IDT[crate::fabric::DOORBELL_VEC as usize] = Gate::new(table[35], 0);
+        IDT[crate::console::IRQ_VECTOR as usize] = Gate::new(table[36], 0);
     }
     load();
     init_syscall();
@@ -304,6 +307,11 @@ extern "C" fn interrupt_dispatch(frame: *mut Frame) {
             crate::rpc::on_tick();
             crate::fabric::on_tick();
             crate::task::on_timer();
+        }
+        36 => {
+            crate::console::on_irq();
+            crate::apic::eoi();
+            crate::task::schedule();
         }
         64 => {
             crate::apic::eoi();

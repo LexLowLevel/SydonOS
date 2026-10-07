@@ -9,7 +9,10 @@ const WAIT: u16 = 6;
 const PS: u16 = 7;
 const CORES: u16 = 10;
 const HANG: u16 = 11;
+const POWEROFF: u16 = 12;
+const IMAGES: u16 = 13;
 const KILL: u16 = 14;
+const CONSOLE_FOREGROUND: u16 = 4;
 
 pub const KILLED: u64 = 130;
 
@@ -29,6 +32,11 @@ pub struct Job {
     pub core: usize,
     pub state: JobState,
     pub name: String,
+}
+
+pub struct Image {
+    pub name: String,
+    pub needs: String,
 }
 
 pub struct CoreInfo {
@@ -102,4 +110,21 @@ pub fn hang(core: usize) -> Result<(), Error> {
 
 pub fn kill(pid: u64) -> Result<(), Error> {
     director()?.call(KILL, Payload::new().word(0, pid).bytes()).map(|_| ())
+}
+
+pub fn images() -> Result<Vec<Image>, Error> {
+    list(IMAGES, |_, p| Image { name: p.get_name(0, 16).to_string(), needs: p.get_name(16, 24).to_string() })
+}
+
+pub fn poweroff() -> Result<(), Error> {
+    director()?.call(POWEROFF, &[]).map(|_| ())
+}
+
+// ctrl-c kills these, until set again. only the shell may.
+pub fn foreground(pids: &[u64]) -> Result<(), Error> {
+    let mut p = Payload::new();
+    for (i, &pid) in pids.iter().take(5).enumerate() {
+        p = p.word(i, pid);
+    }
+    Service::lookup("console")?.call(CONSOLE_FOREGROUND, p.bytes()).map(|_| ())
 }

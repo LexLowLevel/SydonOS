@@ -9,6 +9,7 @@ mod acpi;
 mod apic;
 mod bootinfo;
 mod clock;
+mod console;
 mod cpu;
 mod director;
 mod elf;
@@ -17,6 +18,7 @@ mod frame;
 mod gdt;
 mod heap;
 mod idt;
+mod ioapic;
 mod jobs;
 mod paging;
 mod pit;
@@ -76,7 +78,8 @@ extern "C" fn kernel_main(boot_info: *const BootInfo) -> ! {
     let tsc_per_ms = clock::calibrate();
     println!("apic: {} timer counts per tick, tsc {} per ms", timer_count, tsc_per_ms);
 
-    let cpus = &acpi::cpus();
+    let madt = acpi::madt();
+    let cpus = &madt.cpus;
     println!("acpi: {} cpus, bsp apic {}", cpus.count, apic::id());
     smp::share_console();
     let kernel_elf =
@@ -88,6 +91,10 @@ extern "C" fn kernel_main(boot_info: *const BootInfo) -> ! {
     println!("heap: {} KiB ready, {} KiB free", heap >> 10, frame::total_free() * 4);
 
     rpc::init();
+    console::init();
+    ioapic::init(&madt);
+    ioapic::route_isa(&madt, 4, console::IRQ_VECTOR, apic::id());
+    serial::enable_irqs();
 
     apic::start_timer(timer_count);
     run_core()
@@ -115,7 +122,9 @@ fn core_main(_: u64) {
     ringtest::run();
     if smp::core() == 0 {
         director::init(fabric::cores());
-        director::start_plan();
+        if let Err(status) = director::spawn(b"shell", director::ANY_CORE, 0) {
+            println!("director: could not start the shell (status {})", status);
+        }
     }
     rpc::executor()
 }
@@ -123,6 +132,7 @@ fn core_main(_: u64) {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     println!("cpu {}: kernel panic: {}", smp::core(), info);
+    serial::flush();
     cpu::cli();
     cpu::hlt_loop();
 }

@@ -1,6 +1,6 @@
 use crate::fabric::{self, Msg};
 use crate::sync::IrqCell;
-use crate::{clock, cpu, director, smp, task, user};
+use crate::{clock, console, cpu, director, smp, task, user};
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -9,6 +9,7 @@ pub const PAYLOAD: usize = 40;
 
 pub const SVC_CORE: u16 = 0;
 pub const SVC_DIRECTOR: u16 = 1;
+pub const SVC_CONSOLE: u16 = 2;
 const FIRST_USER_SVC: u16 = 16;
 
 // reply status, the same numbers user space sees
@@ -23,8 +24,11 @@ pub const NO_MEMORY: u8 = 7;
 pub const BUSY: u8 = 8;
 
 pub const ONEWAY: u8 = 1;
+pub const MORE: u8 = 2;
 // only kernels set this, SYS_SUBMIT never does
 const FROM_KERNEL: u8 = 4;
+// set by the kernel on requests from the shell
+const PRIVILEGED: u8 = 8;
 
 const REQUEST: u8 = 1;
 const REPLY: u8 = 2;
@@ -32,6 +36,7 @@ const REPLY: u8 = 2;
 pub const CORE_LOAD: u16 = 1;
 pub const CORE_HANG: u16 = 2;
 pub const CORE_PEER_DOWN: u16 = 3;
+pub const CORE_POWEROFF: u16 = 4;
 pub const CORE_KILL: u16 = 5;
 
 pub const DEFAULT_TIMEOUT: u64 = clock::ms(3000);
@@ -94,6 +99,10 @@ impl Body {
         self.data[at..at + n].copy_from_slice(&name[..n]);
         self.data[at + n..at + max].fill(0);
         self.len = self.len.max((at + max) as u8);
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.data[..self.len as usize]
     }
 }
 
@@ -169,6 +178,7 @@ pub fn token_core(t: u64) -> usize {
 
 pub struct Request {
     pub token: u64,
+    pub src: usize,
     pub op: u16,
     pub flags: u8,
     pub body: Body,
@@ -177,6 +187,10 @@ pub struct Request {
 impl Request {
     pub fn from_kernel(&self) -> bool {
         self.flags & FROM_KERNEL != 0
+    }
+
+    pub fn privileged(&self) -> bool {
+        self.flags & (FROM_KERNEL | PRIVILEGED) != 0
     }
 }
 
@@ -382,12 +396,13 @@ pub fn submit_timeout(h: u64, op: u16, body: Body, then: Then, ticks: u64) -> Re
     })
 }
 
-pub fn submit_user(h: u64, op: u16, body: Body, then: Then, ticks: u64) -> Result<u64, u8> {
+pub fn submit_user(h: u64, op: u16, body: Body, then: Then, ticks: u64, privileged: bool) -> Result<u64, u8> {
+    let flags = if privileged { PRIVILEGED } else { 0 };
     with(|r| {
         if matches!(then, Then::Task(t) if r.open[t] >= OPEN_MAX) {
             return Err(BUSY);
         }
-        let id = r.submit(h, op, body, 0, Some((then, ticks)));
+        let id = r.submit(h, op, body, flags, Some((then, ticks)));
         r.ring();
         id
     })
@@ -396,6 +411,14 @@ pub fn submit_user(h: u64, op: u16, body: Body, then: Then, ticks: u64) -> Resul
 pub fn oneway(h: u64, op: u16, body: Body) {
     with(|r| {
         let _ = r.submit(h, op, body, ONEWAY | FROM_KERNEL, None);
+        r.ring();
+    });
+}
+
+pub fn oneway_more(h: u64, op: u16, body: Body, more: bool) {
+    let flags = ONEWAY | FROM_KERNEL | if more { MORE } else { 0 };
+    with(|r| {
+        let _ = r.submit(h, op, body, flags, None);
         r.ring();
     });
 }
@@ -656,10 +679,15 @@ pub fn svc_reply(task: usize, token: u64, status: u8, body: Body) -> Result<(), 
 
 // owed requests get NO_SERVICE. returns the task's service handles.
 pub fn drop_task(task: usize) -> Vec<u64> {
-    let (gone, owed) = with(|r| {
+    let console = handle(0, SVC_CONSOLE);
+    let (gone, owed, reads) = with(|r| {
+        let mut reads = Vec::new();
         for i in 0..r.pending.len() {
             if r.pending[i].as_ref().is_some_and(|p| matches!(p.then, Then::Task(t) if t == task)) {
-                r.remove(i);
+                let p = r.remove(i);
+                if p.handle == console {
+                    reads.push(p.id);
+                }
             }
         }
         let me = r.me;
@@ -674,11 +702,15 @@ pub fn drop_task(task: usize) -> Vec<u64> {
             }
             _ => true,
         });
-        (gone, owed)
+        (gone, owed, reads)
     });
+    // a killed job's console read must not take the next line typed
     batch(|| {
         for token in owed {
             reply(token, NO_SERVICE, Body::EMPTY);
+        }
+        for id in reads {
+            oneway(console, console::OP_CANCEL, Body::words(&[id]));
         }
     });
     gone
@@ -697,6 +729,7 @@ fn serve(src: usize, pkt: Packet) {
     let oneway = pkt.flags & ONEWAY != 0;
     let req = Request {
         token: if oneway { 0 } else { token_of(src, pkt.id) },
+        src,
         op: pkt.op,
         flags: pkt.flags,
         body: pkt.body,
@@ -743,6 +776,13 @@ fn core_service(req: &Request) -> Answer {
         CORE_PEER_DOWN => {
             peer_down(req.body.word(0) as usize);
             Answer::Reply(OK, Body::EMPTY)
+        }
+        CORE_POWEROFF => {
+            println!("cpu {}: power off", smp::core());
+            crate::serial::flush();
+            // the q35 ACPI power management block, where QEMU listens for S5
+            cpu::outw(0x604, 0x2000);
+            Answer::Reply(INVALID, Body::EMPTY)
         }
         CORE_KILL => match user::kill(req.body.word(0)) {
             true => Answer::Reply(OK, Body::EMPTY),
@@ -809,7 +849,7 @@ fn next_wake(now: u64) -> u64 {
 // interrupts stay off from the queue check until the task blocks
 fn sleep(until: u64) {
     let flags = cpu::push_cli();
-    let busy = with(|r| !r.local.is_empty());
+    let busy = with(|r| !r.local.is_empty()) || console::input_pending();
     if !busy {
         WAKE_AT.store(until, Ordering::Relaxed);
         fabric::wait(!active());
@@ -867,7 +907,7 @@ fn pump() -> usize {
 }
 
 fn work_waiting() -> bool {
-    with(|r| !r.local.is_empty()) || fabric::pending()
+    with(|r| !r.local.is_empty()) || fabric::pending() || console::input_pending()
 }
 
 // not while a job is ready: jobs never preempt the executor
@@ -893,6 +933,7 @@ pub fn executor() -> ! {
         heartbeat(now);
         if core0 {
             director::tick(now);
+            console::process_input();
         }
         if handled == BATCH || (handled > 0 && spin_for_work()) {
             continue;

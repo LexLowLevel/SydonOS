@@ -1,7 +1,6 @@
 use crate::acpi::{Cpus, MAX_CPUS};
 use crate::paging::{self, phys_to_virt, WRITABLE};
 use crate::fabric::{self, Arena};
-use crate::sync::SpinLock;
 use crate::{apic, clock, elf, frame, gdt, heap, idt, pit, rpc, serial, task};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -83,12 +82,11 @@ fn copy_image(kernel_elf: &[u8]) -> u64 {
 }
 
 pub fn share_console() {
-    let page = frame::alloc_zeroed().expect("smp: no console page");
-    let lock = phys_to_virt(page) as *mut SpinLock<()>;
-    unsafe {
-        lock.write(SpinLock::new(()));
-    }
-    serial::share_console(lock);
+    let pages = serial::TX_PAGES;
+    let phys = frame::alloc_contiguous(pages).expect("smp: no console pages");
+    let at = phys_to_virt(phys) as *mut u8;
+    unsafe { core::ptr::write_bytes(at, 0, (pages * frame::FRAME) as usize) };
+    serial::share_console(at as *mut _);
 }
 
 fn install_trampoline() {

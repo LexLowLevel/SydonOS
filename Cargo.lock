@@ -35,7 +35,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "job-kv"
+version = "0.1.0"
+dependencies = [
+ "sydon-rt",
+]
+
+[[package]]
+name = "job-kvbench"
+version = "0.1.0"
+dependencies = [
+ "sydon-rt",
+]
+
+[[package]]
 name = "job-ping"
+version = "0.1.0"
+dependencies = [
+ "sydon-rt",
+]
+
+[[package]]
+name = "job-shell"
 version = "0.1.0"
 dependencies = [
  "sydon-rt",

@@ -16,7 +16,7 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 OUT = os.path.join(ROOT, "out", "bench")
-DONE = "director: boot plan done"
+PROMPT = "sydon> "
 
 
 
@@ -161,14 +161,26 @@ class Vm:
             self.log.write(s)
             self.log.flush()
 
-    # the director runs its plan at boot and says when it is done
+    # the ring test runs at boot, then the director starts the shell
     def boot(self, timeout=120):
         end = time.time() + timeout
-        while DONE not in self.text:
+        while PROMPT not in self.text:
             if time.time() > end or "kernel panic" in self.text:
                 raise RuntimeError("boot failed, see " + self.log.name)
             self.pump(0.1)
         return self.text
+
+    # types a line at the shell and returns what came back up to the next prompt
+    def cmd(self, line, timeout=300):
+        start = len(self.text)
+        before = self.text.count(PROMPT)
+        self.ser.send((line + "\r").encode())
+        end = time.time() + timeout
+        while self.text.count(PROMPT) <= before:
+            if time.time() > end:
+                raise RuntimeError(f"'{line}' timed out, see {self.log.name}")
+            self.pump(0.05)
+        return self.text[start:]
 
     def close(self):
         try:
@@ -237,6 +249,14 @@ def parse_ring(text, res):
 
 
 PING = r"ping: \d+ calls cpu (\d+) -> cpu (\d+): min ([\d.]+) us, avg ([\d.]+) us, max ([\d.]+) us"
+KVBENCH = r"kvbench: cpu \d+ did \d+ ops on \d+ shards in \d+ ms: (\d+) k ops/s, (\d+) failed"
+
+
+def started_on(out):
+    m = re.search(r"started \w+ as pid (\d+) on cpu (\d+)", out)
+    if not m:
+        raise RuntimeError("spawn failed:\n" + out)
+    return int(m.group(1)), int(m.group(2))
 
 
 def run_vm(args, cores, label, body, spread=False):
@@ -279,41 +299,75 @@ def bench_scaling(args):
         res.show(f"{n} cores, {args.runs} runs")
 
 
+# echod on core 1, then ping from core 1 itself and from every other core
 def bench_rpc(args):
     res = Results()
 
     def body(vm):
-        for m in re.finditer(PING, vm.text):
-            name = "same core as echo" if m.group(1) == m.group(2) else "other core"
-            res.add(f"{name}: avg", num(m.group(4)), "us")
-            res.add(f"{name}: min", num(m.group(3)), "us")
+        vm.cmd("spawn echod --on 1")
+        for core in [1] + [c for c in range(args.cores) if c != 1]:
+            m = re.search(PING, vm.cmd(f"run ping --on {core}"))
+            if m:
+                name = "same core as echo" if m.group(1) == m.group(2) else "other core"
+                res.add(f"{name}: avg", num(m.group(4)), "us")
+                res.add(f"{name}: min", num(m.group(3)), "us")
 
     for r in range(args.runs):
         run_vm(args, args.cores, f"rpc-{args.cores}c-run{r}", body)
     res.show(f"rpc round trip (ping -> echo, 1000 calls), {args.cores} cores, {args.runs} runs")
 
 
+def bench_kv(args):
+    res = Results()
+
+    def scenario(shards, clients):
+        def body(vm):
+            for _ in range(shards):
+                started_on(vm.cmd("spawn kv"))
+            pids = [started_on(vm.cmd("spawn kvbench"))[0] for _ in range(clients)]
+            for pid in pids:
+                vm.cmd(f"wait {pid}")
+            total, failed = 0.0, 0
+            for m in re.finditer(KVBENCH, vm.text):
+                total += num(m.group(1))
+                failed += int(m.group(2))
+            if failed:
+                print(f"warning: {failed} kv operations failed", file=sys.stderr)
+            res.add(f"{shards} shards, {clients} clients", total, "k ops/s")
+        return body
+
+    for shards in args.shards:
+        for clients in args.clients:
+            for r in range(args.runs):
+                run_vm(args, args.cores, f"kv-{shards}s-{clients}c-run{r}", scenario(shards, clients))
+    res.show(f"kv store, total throughput, {args.cores} cores, {args.runs} runs")
+
+
 def main():
     p = argparse.ArgumentParser(
         prog="bench.sh",
         description="Boots sydonOS under QEMU with every virtual core pinned to its own physical core, "
-                    "reads what the kernel and its boot jobs measure, and prints median (min - max) over the runs.",
+                    "runs a benchmark through the shell several times and prints median (min - max).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""benchmarks:
   ring       the boot-time ring test: round trips, doorbell, streaming, all-to-all
   scaling    the ring test on several core counts (--counts 2 4 8)
-  rpc        ping -> echo round trips from the boot plan: same core and every other core
+  rpc        ping -> echo round trips: same core and every other core
+  kv         sharded key-value store (--shards 1 4 --clients 1 4)
 
 examples:
   ./bench.sh ring --cores 4
   ./bench.sh scaling --counts 2 4 6 8 --runs 3
-  ./bench.sh rpc --cores 8""")
+  ./bench.sh rpc --cores 8
+  ./bench.sh kv --shards 1 4 --clients 4""")
 
-    p.add_argument("bench", choices=["ring", "scaling", "rpc"])
+    p.add_argument("bench", choices=["ring", "scaling", "rpc", "kv"])
     p.add_argument("--cores", type=int, default=4, help="virtual cores (default 4)")
     p.add_argument("--counts", type=int, nargs="+", help="core counts for scaling")
     p.add_argument("--runs", type=int, default=3, help="repeat each measurement (default 3)")
     p.add_argument("--cpus", type=lambda s: [int(c) for c in s.split(",")], help="host cpus to pin to, e.g. 0,2,4,6")
+    p.add_argument("--shards", type=int, nargs="+", default=[1, 4])
+    p.add_argument("--clients", type=int, nargs="+", default=[1, 4])
     p.add_argument("--mem", default="512M")
     p.add_argument("--no-kvm", dest="kvm", action="store_false", help="use TCG emulation")
     p.add_argument("--no-pin", dest="pin", action="store_false", help="let the host schedule the vcpus")
@@ -335,7 +389,7 @@ examples:
         raise SystemExit("out/disk.img missing, run ./build.sh or pass --build")
     args.logs = os.path.join(OUT, time.strftime("%Y%m%d-%H%M%S") + f"-{args.bench}")
 
-    {"ring": bench_ring, "scaling": bench_scaling, "rpc": bench_rpc}[args.bench](args)
+    {"ring": bench_ring, "scaling": bench_scaling, "rpc": bench_rpc, "kv": bench_kv}[args.bench](args)
     print(f"\nlogs: {os.path.relpath(args.logs, ROOT)}")
 
 

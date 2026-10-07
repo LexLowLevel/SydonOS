@@ -13,6 +13,8 @@ pub const OP_PS: u16 = 7;
 pub const OP_EXITED: u16 = 8;
 pub const OP_CORES: u16 = 10;
 pub const OP_HANG: u16 = 11;
+pub const OP_POWEROFF: u16 = 12;
+pub const OP_IMAGES: u16 = 13;
 pub const OP_KILL: u16 = 14;
 
 pub const ANY_CORE: u64 = u64::MAX;
@@ -100,7 +102,10 @@ pub fn init(cores: usize) {
     };
     *DIRECTOR.lock() = Some(d);
     rpc::register_kernel(rpc::SVC_DIRECTOR, handler);
-    with(|d| d.registry.push(Entry { name: name32(b"director"), handle: rpc::handle(0, rpc::SVC_DIRECTOR) }));
+    with(|d| {
+        d.registry.push(Entry { name: name32(b"director"), handle: rpc::handle(0, rpc::SVC_DIRECTOR) });
+        d.registry.push(Entry { name: name32(b"console"), handle: rpc::handle(0, rpc::SVC_CONSOLE) });
+    });
 }
 
 impl Director {
@@ -198,16 +203,26 @@ fn loaded(pid: u64, pkt: &Packet) {
     }
 }
 
-// no job is trusted with these yet
 fn kernel_only(op: u16) -> bool {
-    matches!(op, OP_REGISTER | OP_UNREGISTER | OP_EXITED | OP_HANG | OP_KILL)
+    matches!(op, OP_REGISTER | OP_UNREGISTER | OP_EXITED)
 }
 
+// the shell is the only job trusted with these
+fn privileged_only(op: u16) -> bool {
+    matches!(op, OP_HANG | OP_POWEROFF | OP_KILL)
+}
+
+// the shell itself cannot be killed, it would leave nothing to type into
 pub fn kill(pid: u64) -> u8 {
-    let core = with(|d| d.jobs.iter().find(|j| j.pid == pid && matches!(j.state, State::Starting | State::Running)).map(|j| j.core));
-    match core {
+    let target = with(|d| {
+        let j = d.jobs.iter().find(|j| j.pid == pid && matches!(j.state, State::Starting | State::Running))?;
+        let privileged = jobs::builtin(trimmed(&j.name)).is_some_and(|b| b.privileged);
+        Some((j.core, privileged))
+    });
+    match target {
         None => NOT_FOUND,
-        Some(core) => {
+        Some((_, true)) => INVALID,
+        Some((core, false)) => {
             rpc::oneway(rpc::handle(core, rpc::SVC_CORE), rpc::CORE_KILL, Body::words(&[pid]));
             OK
         }
@@ -216,7 +231,7 @@ pub fn kill(pid: u64) -> u8 {
 
 fn handler(req: &Request) -> Answer {
     let b = &req.body;
-    if kernel_only(req.op) && !req.from_kernel() {
+    if (kernel_only(req.op) && !req.from_kernel()) || (privileged_only(req.op) && !req.privileged()) {
         return Answer::Reply(INVALID, Body::EMPTY);
     }
     match req.op {
@@ -305,6 +320,19 @@ fn handler(req: &Request) -> Answer {
             Answer::Reply(OK, Body::EMPTY)
         }
         OP_KILL => Answer::Reply(kill(b.word(0)), Body::EMPTY),
+        OP_IMAGES => match jobs::BUILTIN.get(b.word(0) as usize) {
+            Some(job) => {
+                let mut out = Body::EMPTY;
+                out.set_name(0, 16, job.name.as_bytes());
+                out.set_name(16, 24, job.needs.as_bytes());
+                Answer::Reply(OK, out)
+            }
+            None => Answer::Reply(NOT_FOUND, Body::EMPTY),
+        },
+        OP_POWEROFF => {
+            rpc::oneway(rpc::handle(0, rpc::SVC_CORE), rpc::CORE_POWEROFF, Body::EMPTY);
+            Answer::Reply(OK, Body::EMPTY)
+        }
         _ => Answer::Reply(INVALID, Body::EMPTY),
     }
 }
@@ -357,57 +385,4 @@ fn mark_down(core: usize) {
     for c in others {
         rpc::oneway(rpc::handle(c, rpc::SVC_CORE), rpc::CORE_PEER_DOWN, Body::words(&[core as u64]));
     }
-}
-
-// nothing else can start jobs yet, so the director runs a fixed plan
-pub fn start_plan() {
-    if task::spawn(plan, 0, false).is_none() {
-        println!("director: no task for the boot plan");
-    }
-}
-
-fn ask(op: u16, body: Body) -> Packet {
-    let director = rpc::handle(0, rpc::SVC_DIRECTOR);
-    match rpc::submit_timeout(director, op, body, Then::Task(task::current()), rpc::NEVER) {
-        Ok(id) => rpc::wait(id).unwrap_or_else(|| Packet::status_only(INVALID)),
-        Err(status) => Packet::status_only(status),
-    }
-}
-
-fn start(name: &str, core: u64) -> Option<u64> {
-    let mut body = Body::words(&[core]);
-    body.set_name(8, 32, name.as_bytes());
-    let p = ask(OP_SPAWN, body);
-    if p.status != OK {
-        println!("director: could not start {} (status {})", name, p.status);
-        return None;
-    }
-    Some(p.body.word(0))
-}
-
-fn run(name: &str, core: u64) {
-    if let Some(pid) = start(name, core) {
-        ask(OP_WAIT, Body::words(&[pid]));
-    }
-}
-
-fn plan(_: u64) {
-    let cores = fabric::cores() as u64;
-    run("hello", ANY_CORE);
-    let echo_core = if cores > 1 { 1 } else { 0 };
-    if start("echod", echo_core).is_some() {
-        let mut key = Body::EMPTY;
-        key.set_name(0, 32, b"echo");
-        while ask(OP_LOOKUP, key).status != OK {
-            task::sleep_until(task::ticks() + crate::clock::ms(1));
-        }
-        run("ping", echo_core);
-        for c in (0..cores).filter(|&c| c != echo_core) {
-            run("ping", c);
-        }
-        run("flood", ANY_CORE);
-    }
-    run("fault", ANY_CORE);
-    run("ticker", ANY_CORE);
-    println!("director: boot plan done");
 }
