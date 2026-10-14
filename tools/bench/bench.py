@@ -178,10 +178,6 @@ class Vm:
             self.log.write(s)
             self.log.flush()
 
-<<<<<<< Updated upstream
-    # the ring test runs at boot, then the director starts the shell
-=======
->>>>>>> Stashed changes
     def boot(self, timeout=120):
         end = time.time() + timeout
         while PROMPT not in self.text:
@@ -190,10 +186,6 @@ class Vm:
             self.pump(0.1)
         return self.text
 
-<<<<<<< Updated upstream
-    # types a line at the shell and returns what came back up to the next prompt
-=======
->>>>>>> Stashed changes
     def cmd(self, line, timeout=300):
         start = len(self.text)
         before = self.text.count(PROMPT)
@@ -272,13 +264,10 @@ def parse_ring(text, res):
 
 
 PING = r"ping: \d+ calls cpu (\d+) -> cpu (\d+): min ([\d.]+) us, avg ([\d.]+) us, max ([\d.]+) us"
-<<<<<<< Updated upstream
-=======
 FSBENCH_SEQ = r"fsbench: cpu (\d+) read \d+ MiB sequentially in \d+ ms: (\d+) MiB/s"
 FSBENCH_RAND = r"fsbench: cpu \d+ did \d+ random 4K reads: (\d+) k reads/s"
 FSRAND = r"fsrand: cpu \d+ did \d+ random 4K reads: (\d+) k reads/s"
 READ_FAILURES = r"random 4K reads: \d+ k reads/s, (\d+) failed"
->>>>>>> Stashed changes
 KVBENCH = r"kvbench: cpu \d+ did \d+ ops on \d+ shards in \d+ ms: (\d+) k ops/s, (\d+) failed"
 
 
@@ -287,10 +276,7 @@ def started_on(out):
     if not m:
         raise RuntimeError("spawn failed:\n" + out)
     return int(m.group(1)), int(m.group(2))
-<<<<<<< Updated upstream
-=======
 
->>>>>>> Stashed changes
 
 
 def run_vm(args, cores, label, body, spread=False):
@@ -333,20 +319,10 @@ def bench_scaling(args):
         res.show(f"{n} cores, {args.runs} runs")
 
 
-# echod on core 1, then ping from core 1 itself and from every other core
 def bench_rpc(args):
     res = Results()
 
     def body(vm):
-<<<<<<< Updated upstream
-        vm.cmd("spawn echod --on 1")
-        for core in [1] + [c for c in range(args.cores) if c != 1]:
-            m = re.search(PING, vm.cmd(f"run ping --on {core}"))
-            if m:
-                name = "same core as echo" if m.group(1) == m.group(2) else "other core"
-                res.add(f"{name}: avg", num(m.group(4)), "us")
-                res.add(f"{name}: min", num(m.group(3)), "us")
-=======
         _, echo = started_on(vm.cmd("spawn echod"))
         variants = [("placed by director", "run ping")]
         variants.append(("same core as echo", f"run ping --on {echo}"))
@@ -365,7 +341,6 @@ def bench_rpc(args):
                 res.add(f"{name}: min", num(m.group(3)), "us")
         if args.stats:
             print(vm.cmd("stats"))
->>>>>>> Stashed changes
 
     for r in range(args.runs):
         run_vm(args, args.cores, f"rpc-{args.cores}c-run{r}", body)
@@ -380,26 +355,17 @@ def bench_kv(args):
             for _ in range(shards):
                 started_on(vm.cmd("spawn kv"))
             pids = [started_on(vm.cmd("spawn kvbench"))[0] for _ in range(clients)]
-<<<<<<< Updated upstream
-            for pid in pids:
-                vm.cmd(f"wait {pid}")
-            total, failed = 0.0, 0
-=======
             total, failed = 0.0, 0
             for pid in pids:
                 vm.cmd(f"wait {pid}")
->>>>>>> Stashed changes
             for m in re.finditer(KVBENCH, vm.text):
                 total += num(m.group(1))
                 failed += int(m.group(2))
             if failed:
                 print(f"warning: {failed} kv operations failed", file=sys.stderr)
             res.add(f"{shards} shards, {clients} clients", total, "k ops/s")
-<<<<<<< Updated upstream
-=======
             if args.stats:
                 print(vm.cmd("stats"))
->>>>>>> Stashed changes
         return body
 
     for shards in args.shards:
@@ -409,8 +375,6 @@ def bench_kv(args):
     res.show(f"kv store, total throughput, {args.cores} cores, {args.runs} runs")
 
 
-<<<<<<< Updated upstream
-=======
 def bench_io(args):
     res = Results()
 
@@ -841,24 +805,15 @@ def bench_shell(args):
 
 
 
->>>>>>> Stashed changes
 def main():
     p = argparse.ArgumentParser(
         prog="bench.sh",
         description="Boots sydonOS under QEMU with every virtual core pinned to its own physical core, "
-<<<<<<< Updated upstream
-                    "runs a benchmark through the shell several times and prints median (min - max).",
-=======
                     "runs a benchmark several times and prints median (min - max).",
->>>>>>> Stashed changes
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""benchmarks:
   ring       the boot-time ring test: round trips, doorbell, streaming, all-to-all
   scaling    the ring test on several core counts (--counts 2 4 8)
-<<<<<<< Updated upstream
-  rpc        ping -> echo round trips: same core and every other core
-  kv         sharded key-value store (--shards 1 4 --clients 1 4)
-=======
   rpc        ping -> echo round trips, placed by the director, same core, other L3
   kv         sharded key-value store (--shards 1 4 --clients 1 4)
   io         file reads through the storage core: placed, on the owner, remote, and with both busy
@@ -871,31 +826,20 @@ def main():
   sel4       seL4 IPC on the same core and across cores, in the same vm (needs tools/bench/sel4/setup.sh)
   host       the same patterns as plain linux threads, for comparison
   shell      boot and run your own shell commands, e.g. shell -- "spawn echod" "run ping"
->>>>>>> Stashed changes
 
 examples:
   ./bench.sh ring --cores 4
   ./bench.sh scaling --counts 2 4 6 8 --runs 3
-<<<<<<< Updated upstream
-  ./bench.sh rpc --cores 8
-  ./bench.sh kv --shards 1 4 --clients 4""")
-
-    p.add_argument("bench", choices=["ring", "scaling", "rpc", "kv"])
-=======
   ./bench.sh kv --cores 8 --shards 1 4 --clients 4
   ./bench.sh host""")
     p.add_argument("bench", choices=["ring", "scaling", "rpc", "kv", "io", "write", "pipe", "linuxvm", "sel4", "switch", "idle", "smt", "host", "shell"])
->>>>>>> Stashed changes
     p.add_argument("--cores", type=int, default=4, help="virtual cores (default 4)")
     p.add_argument("--counts", type=int, nargs="+", help="core counts for scaling and host all-to-all")
     p.add_argument("--runs", type=int, default=3, help="repeat each measurement (default 3)")
     p.add_argument("--cpus", type=lambda s: [int(c) for c in s.split(",")], help="host cpus to pin to, e.g. 0,2,4,6")
     p.add_argument("--shards", type=int, nargs="+", default=[1, 4])
     p.add_argument("--clients", type=int, nargs="+", default=[1, 4])
-<<<<<<< Updated upstream
-=======
     p.add_argument("--bytes", type=int, default=1 << 30, help="bytes through the pipes (default 1 GiB)")
->>>>>>> Stashed changes
     p.add_argument("--mem", default="512M")
     p.add_argument("--kernel", help="bzImage for linuxvm (default: the host's kernel)")
     p.add_argument("--sel4", default=os.path.join(os.path.dirname(ROOT), "sel4bench"),
@@ -931,15 +875,10 @@ examples:
     if args.iothread:
         args.disk_device = ["-object", "iothread,id=io0", "-device", "virtio-blk-pci,drive=fs,disable-legacy=on,iothread=io0"]
 
-<<<<<<< Updated upstream
-    {"ring": bench_ring, "scaling": bench_scaling, "rpc": bench_rpc, "kv": bench_kv}[args.bench](args)
-    print(f"\nlogs: {os.path.relpath(args.logs, ROOT)}")
-=======
     {"ring": bench_ring, "scaling": bench_scaling, "rpc": bench_rpc, "kv": bench_kv,
      "io": bench_io, "pipe": bench_pipe, "write": bench_write, "linuxvm": bench_linuxvm, "sel4": bench_sel4, "switch": bench_switch, "idle": bench_idle, "smt": bench_smt, "host": bench_host, "shell": bench_shell}[args.bench](args)
     if args.bench != "host":
         print(f"\nlogs: {os.path.relpath(args.logs, ROOT)}")
->>>>>>> Stashed changes
 
 
 if __name__ == "__main__":

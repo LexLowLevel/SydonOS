@@ -10,11 +10,8 @@ pub const PAYLOAD: usize = 40;
 pub const SVC_CORE: u16 = 0;
 pub const SVC_DIRECTOR: u16 = 1;
 pub const SVC_CONSOLE: u16 = 2;
-<<<<<<< Updated upstream
-=======
 pub const SVC_FS: u16 = 3;
 pub const SVC_PIPE: u16 = 4;
->>>>>>> Stashed changes
 const FIRST_USER_SVC: u16 = 16;
 
 // reply status, the same numbers user space sees
@@ -35,13 +32,8 @@ pub const ONEWAY: u8 = 1;
 pub const MORE: u8 = 2;
 // only kernels set this, SYS_SUBMIT never does
 const FROM_KERNEL: u8 = 4;
-<<<<<<< Updated upstream
-// set by the kernel on requests from the shell
-const PRIVILEGED: u8 = 8;
-=======
 const PRIVILEGED: u8 = 8;
 const BUF: u8 = 16;
->>>>>>> Stashed changes
 
 const REQUEST: u8 = 1;
 const REPLY: u8 = 2;
@@ -210,14 +202,11 @@ impl Request {
     pub fn privileged(&self) -> bool {
         self.flags & (FROM_KERNEL | PRIVILEGED) != 0
     }
-<<<<<<< Updated upstream
-=======
 
     // the buffer that came with the request, now owned by whoever serves it
     pub fn buf(&self) -> Option<u64> {
         (self.flags & BUF != 0 && crate::bufs::valid(self.body.word(4))).then(|| self.body.word(4))
     }
->>>>>>> Stashed changes
 }
 
 pub enum Answer {
@@ -473,10 +462,6 @@ pub fn submit_timeout(h: u64, op: u16, body: Body, then: Then, ticks: u64) -> Re
     })
 }
 
-<<<<<<< Updated upstream
-pub fn submit_user(h: u64, op: u16, body: Body, then: Then, ticks: u64, privileged: bool) -> Result<u64, u8> {
-    let flags = if privileged { PRIVILEGED } else { 0 };
-=======
 pub fn submit_buf(h: u64, op: u16, mut body: Body, buf: u64, then: Then) -> Result<u64, u8> {
     body.set_word(4, buf);
     with(|r| {
@@ -492,7 +477,6 @@ pub fn submit_user(h: u64, op: u16, mut body: Body, then: Then, ticks: u64, priv
         body.set_word(4, b);
         flags |= BUF;
     }
->>>>>>> Stashed changes
     with(|r| {
         if matches!(then, Then::Task(t) if r.open[t] >= OPEN_MAX) {
             return Err(BUSY);
@@ -825,8 +809,6 @@ pub fn take_buf(task: usize, buf: u64) -> bool {
 
 pub fn drop_task(task: usize) -> Vec<u64> {
     let console = handle(0, SVC_CONSOLE);
-<<<<<<< Updated upstream
-=======
     let held: Vec<u64> = with(|r| {
         let held = r.bufs.iter().filter(|&&(t, _)| t == task).map(|&(_, b)| b).collect();
         r.bufs.retain(|&(t, _)| t != task);
@@ -835,7 +817,6 @@ pub fn drop_task(task: usize) -> Vec<u64> {
     for b in held {
         crate::bufs::free(b);
     }
->>>>>>> Stashed changes
     let (gone, owed, reads) = with(|r| {
         let mut reads = Vec::new();
         for i in 0..r.pending.len() {
@@ -860,7 +841,6 @@ pub fn drop_task(task: usize) -> Vec<u64> {
         });
         (gone, owed, reads)
     });
-    // a killed job's console read must not take the next line typed
     batch(|| {
         for token in owed {
             reply(token, NO_SERVICE, Body::EMPTY);
@@ -941,14 +921,6 @@ fn core_service(req: &Request) -> Answer {
             peer_down(req.body.word(0) as usize);
             Answer::Reply(OK, Body::EMPTY)
         }
-<<<<<<< Updated upstream
-        CORE_POWEROFF => {
-            println!("cpu {}: power off", smp::core());
-            crate::serial::flush();
-            // the q35 ACPI power management block, where QEMU listens for S5
-            cpu::outw(0x604, 0x2000);
-            Answer::Reply(INVALID, Body::EMPTY)
-=======
         CORE_PEER_UP => {
             peer_up(req.body.word(0) as usize);
             Answer::Reply(OK, Body::EMPTY)
@@ -967,7 +939,6 @@ fn core_service(req: &Request) -> Answer {
         CORE_BUF_FREE => {
             crate::bufs::free_local(req.body.word(0));
             Answer::Reply(OK, Body::EMPTY)
->>>>>>> Stashed changes
         }
         CORE_KILL => match user::kill(req.body.word(0)) {
             true => Answer::Reply(OK, Body::EMPTY),
@@ -1041,11 +1012,7 @@ fn next_wake(now: u64) -> u64 {
 // interrupts stay off from the queue check until the task blocks
 fn sleep(until: u64) {
     let flags = cpu::push_cli();
-<<<<<<< Updated upstream
-    let busy = with(|r| !r.local.is_empty()) || console::input_pending();
-=======
     let busy = with(|r| !r.local.is_empty()) || console::input_pending() || crate::virtio_blk::pending();
->>>>>>> Stashed changes
     if !busy {
         WAKE_AT.store(until, Ordering::Relaxed);
         fabric::wait(!active());
@@ -1103,11 +1070,7 @@ fn pump() -> usize {
 }
 
 fn work_waiting() -> bool {
-<<<<<<< Updated upstream
-    with(|r| !r.local.is_empty()) || fabric::pending() || console::input_pending()
-=======
     with(|r| !r.local.is_empty()) || fabric::pending() || console::input_pending() || crate::virtio_blk::pending()
->>>>>>> Stashed changes
 }
 
 // not while a job is ready: jobs never preempt the executor

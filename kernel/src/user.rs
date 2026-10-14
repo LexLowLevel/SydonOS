@@ -6,13 +6,9 @@ use crate::paging::{self, phys_to_virt, USER, WRITABLE};
 use crate::rpc::{self, Body, Taken, BUSY, INVALID, NO_MEMORY, OK, PAYLOAD};
 use crate::sync::{IrqCell, SpinLock};
 use crate::task::{self, MAX_TASKS};
-<<<<<<< Updated upstream
-use crate::{clock, console, jobs, smp};
-=======
 use crate::{bufs, clock, console, fs, jobs, smp};
 use crate::rpc::Answer;
 use alloc::vec::Vec;
->>>>>>> Stashed changes
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -73,10 +69,7 @@ struct Proc {
     pid: u64,
     heap_top: u64,
     privileged: bool,
-<<<<<<< Updated upstream
-=======
     closes: [Close; 3],
->>>>>>> Stashed changes
 }
 
 static PROCS: IrqCell<[Option<Proc>; MAX_TASKS]> = IrqCell::new([None; MAX_TASKS]);
@@ -90,16 +83,6 @@ pub fn load_job(pid: u64, name: &[u8], token: u64, start: Option<u64>) -> Answer
         Ok(start) => start,
         Err(status) => return Answer::Reply(status, Body::EMPTY),
     };
-<<<<<<< Updated upstream
-    match spawn_image(pid, b.image, b.privileged) {
-        Ok(()) => Answer::Reply(OK, Body::EMPTY),
-        Err(status) => Answer::Reply(status, Body::EMPTY),
-    }
-}
-
-fn spawn_image(pid: u64, image: &[u8], privileged: bool) -> Result<(), u8> {
-    let (pml4, launch) = load(image)?;
-=======
     if let Some(b) = jobs::builtin(name) {
         return match launch(pid, b.image, b.traits.privileged, start) {
             Ok(pipe) => Answer::Reply(OK, Body::words(&pipe)),
@@ -277,17 +260,12 @@ pub fn spawn_image(pid: u64, image: &[u8], privileged: bool, start: &[u8]) -> Re
         launch.start = at;
         launch.start_len = start.len() as u64;
     }
->>>>>>> Stashed changes
     let arg = Box::into_raw(Box::new(launch));
     // the loader can be preempted, and the job must not run before its Proc exists
     let flags = crate::cpu::push_cli();
     let tid = task::spawn_in(run, arg as u64, false, pml4);
     if let Some(tid) = tid {
-<<<<<<< Updated upstream
-        PROCS.with(|p| p[tid] = Some(Proc { pid, heap_top: HEAP_BASE, privileged }));
-=======
         PROCS.with(|p| p[tid] = Some(Proc { pid, heap_top: HEAP_BASE, privileged, closes: closes(start) }));
->>>>>>> Stashed changes
     }
     crate::cpu::pop_flags(flags);
     if tid.is_none() {
@@ -494,21 +472,17 @@ pub fn syscall(f: &mut Frame) {
     let (a, b, c, d) = (f.rdi, f.rsi, f.rdx, f.r10);
     let me = task::current();
     f.rax = match f.rax {
-        // through the console, so job output and line editing do not mix
         SYS_PRINT => match user_bytes(a, b, PRINT_MAX) {
             Some(bytes) if smp::core() == 0 => {
                 console::write(bytes);
                 0
             }
             Some(bytes) => {
-<<<<<<< Updated upstream
-=======
                 // prints are one-way, so a job printing in a loop would fill this
                 // core's outbox and then its heap. it waits for room instead.
                 while rpc::outbox_len() > OUTBOX_MAX {
                     task::sleep_until(task::ticks() + 1);
                 }
->>>>>>> Stashed changes
                 console::print_remote(bytes);
                 0
             }
@@ -521,11 +495,7 @@ pub fn syscall(f: &mut Frame) {
         }
         SYS_TIME => clock::now_ns(),
         SYS_SUBMIT => match user_bytes(c, d, PAYLOAD) {
-<<<<<<< Updated upstream
-            Some(bytes) => match rpc::submit_user(a, b as u16, Body::bytes(bytes), rpc::Then::Task(me), timeout(f.r8), privileged()) {
-=======
             Some(bytes) => match rpc::submit_user(a, b as u16, Body::bytes(bytes), rpc::Then::Task(me), timeout(f.r8), privileged(), None) {
->>>>>>> Stashed changes
                 Ok(id) => id,
                 Err(status) => err(status),
             },

@@ -9,6 +9,7 @@ pub const OP_PRINT: u16 = 1;
 pub const OP_READ: u16 = 2;
 pub const OP_CANCEL: u16 = 3;
 pub const OP_FOREGROUND: u16 = 4;
+pub const OP_FOREGROUND_ADD: u16 = 5;
 
 pub const IRQ_VECTOR: u8 = 0x24;
 
@@ -108,10 +109,13 @@ fn handler(req: &Request) -> Answer {
             with(|c| c.readers.retain(|&t| t != token));
             Answer::Reply(OK, Body::EMPTY)
         }
-        // the jobs ctrl-c kills, set by the shell while it waits for them
-        OP_FOREGROUND if req.privileged() => {
+        // the jobs ctrl-c kills, set by the shell while it waits for them.
+        // a long pipeline sends them five at a time.
+        OP_FOREGROUND | OP_FOREGROUND_ADD if req.privileged() => {
             with(|c| {
-                c.foreground.clear();
+                if req.op == OP_FOREGROUND {
+                    c.foreground.clear();
+                }
                 c.foreground.extend((0..5).map(|i| req.body.word(i)).filter(|&p| p != 0));
             });
             Answer::Reply(OK, Body::EMPTY)

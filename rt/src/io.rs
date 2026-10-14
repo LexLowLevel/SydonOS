@@ -1,10 +1,3 @@
-<<<<<<< Updated upstream
-use crate::rpc::Service;
-use crate::{sys, String};
-use core::fmt;
-
-const CONSOLE_READ: u16 = 2;
-=======
 use crate::fs::File;
 use crate::rpc::{Error, Payload, Pending, Service};
 use crate::sys;
@@ -364,7 +357,6 @@ pub fn flush() {
         settle(o, 0);
     }
 }
->>>>>>> Stashed changes
 
 // formats the whole thing first so one print is one piece of output
 pub fn _print(args: fmt::Arguments) {
@@ -389,23 +381,6 @@ macro_rules! println {
     ($($arg:tt)*) => ($crate::io::_print(format_args!("{}\n", format_args!($($arg)*))));
 }
 
-<<<<<<< Updated upstream
-// a line typed at the console, without its newline. None at end of input
-// (ctrl-d on an empty line) or when there is no console.
-pub fn read_line() -> Option<String> {
-    let console = Service::lookup("console").ok()?;
-    let mut line = alloc::vec::Vec::new();
-    loop {
-        let p = console.call_forever(CONSOLE_READ, &[]).ok()?;
-        if p.len == 0 {
-            return None;
-        }
-        line.extend_from_slice(p.bytes());
-        if line.last() == Some(&b'\n') {
-            line.pop();
-            return Some(String::from_utf8_lossy(&line).into());
-        }
-=======
 #[macro_export]
 macro_rules! eprint {
     ($($arg:tt)*) => ($crate::io::_eprint(format_args!($($arg)*)));
@@ -433,6 +408,5 @@ pub fn set_foreground(pids: &[u64]) -> Result<(), Error> {
             return Ok(());
         }
         op = CONSOLE_FOREGROUND_ADD;
->>>>>>> Stashed changes
     }
 }

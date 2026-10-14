@@ -146,11 +146,7 @@ fn core_main(_: u64) {
     }
     if smp::core() == 0 {
         director::init(fabric::cores());
-<<<<<<< Updated upstream
-        if let Err(status) = director::spawn(b"shell", director::ANY_CORE, 0) {
-=======
         if let Err(status) = director::spawn(b"shell", director::ANY_CORE, 0, None) {
->>>>>>> Stashed changes
             println!("director: could not start the shell (status {})", status);
         }
     }

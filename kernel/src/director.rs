@@ -153,13 +153,6 @@ pub fn init(cores: usize) {
     d.registry.push(Entry { name: name32(b"console"), handle: rpc::handle(0, rpc::SVC_CONSOLE) });
     *DIRECTOR.lock() = Some(d);
     rpc::register_kernel(rpc::SVC_DIRECTOR, handler);
-<<<<<<< Updated upstream
-    with(|d| {
-        d.registry.push(Entry { name: name32(b"director"), handle: rpc::handle(0, rpc::SVC_DIRECTOR) });
-        d.registry.push(Entry { name: name32(b"console"), handle: rpc::handle(0, rpc::SVC_CONSOLE) });
-    });
-=======
->>>>>>> Stashed changes
 }
 
 impl Director {
@@ -357,10 +350,6 @@ fn loaded(pid: u64, pkt: &Packet) {
     }
 }
 
-<<<<<<< Updated upstream
-fn kernel_only(op: u16) -> bool {
-    matches!(op, OP_REGISTER | OP_UNREGISTER | OP_EXITED)
-=======
 fn power_off(_: u64, _: &Packet) {
     rpc::oneway(rpc::handle(0, rpc::SVC_CORE), rpc::CORE_POWEROFF, Body::EMPTY);
 }
@@ -389,23 +378,12 @@ fn start_copy(buf: u64) -> Vec<u8> {
         }
     }
     start
->>>>>>> Stashed changes
 }
 
-// the shell is the only job trusted with these
-fn privileged_only(op: u16) -> bool {
-    matches!(op, OP_HANG | OP_POWEROFF | OP_KILL)
-}
-
-// the shell itself cannot be killed, it would leave nothing to type into
 pub fn kill(pid: u64) -> u8 {
     let target = with(|d| {
         let j = d.jobs.iter().find(|j| j.pid == pid && matches!(j.state, State::Starting | State::Running))?;
-<<<<<<< Updated upstream
-        let privileged = jobs::builtin(trimmed(&j.name)).is_some_and(|b| b.privileged);
-=======
         let privileged = jobs::builtin(trimmed(&j.name)).is_some_and(|b| b.traits.privileged);
->>>>>>> Stashed changes
         Some((j.core, privileged))
     });
     match target {
@@ -533,8 +511,6 @@ fn handler(req: &Request) -> Answer {
             Answer::Reply(OK, Body::EMPTY)
         }
         OP_KILL => Answer::Reply(kill(b.word(0)), Body::EMPTY),
-<<<<<<< Updated upstream
-=======
         OP_STATS => {
             let h = rpc::handle(b.word(0) as usize, rpc::SVC_CORE);
             match rpc::submit(h, rpc::CORE_STATS, Body::EMPTY, Then::Call(forward, req.token)) {
@@ -542,30 +518,21 @@ fn handler(req: &Request) -> Answer {
                 Err(status) => Answer::Reply(status, Body::EMPTY),
             }
         }
->>>>>>> Stashed changes
         OP_IMAGES => match jobs::BUILTIN.get(b.word(0) as usize) {
             Some(job) => {
                 let mut out = Body::EMPTY;
                 out.set_name(0, 16, job.name.as_bytes());
-<<<<<<< Updated upstream
-                out.set_name(16, 24, job.needs.as_bytes());
-=======
                 out.set_name(16, 24, job.traits.needs().unwrap_or(b""));
->>>>>>> Stashed changes
                 Answer::Reply(OK, out)
             }
             None => Answer::Reply(NOT_FOUND, Body::EMPTY),
         },
         OP_POWEROFF => {
-<<<<<<< Updated upstream
-            rpc::oneway(rpc::handle(0, rpc::SVC_CORE), rpc::CORE_POWEROFF, Body::EMPTY);
-=======
             let fs = with(|d| d.registry.iter().find(|e| e.name == name32(b"fs")).map(|e| e.handle));
             let synced = fs.map(|h| rpc::submit(h, crate::fs::OP_SYNC, Body::EMPTY, Then::Call(power_off, 0)));
             if !matches!(synced, Some(Ok(_))) {
                 rpc::oneway(rpc::handle(0, rpc::SVC_CORE), rpc::CORE_POWEROFF, Body::EMPTY);
             }
->>>>>>> Stashed changes
             Answer::Reply(OK, Body::EMPTY)
         }
         _ => Answer::Reply(INVALID, Body::EMPTY),
@@ -626,8 +593,6 @@ fn mark_down(core: usize) {
         println!("director: no task to bring cpu {} back", core);
     }
 }
-<<<<<<< Updated upstream
-=======
 
 struct Rescue {
     core: usize,
@@ -697,4 +662,3 @@ fn rescue_task(arg: u64) {
         }
     }
 }
->>>>>>> Stashed changes

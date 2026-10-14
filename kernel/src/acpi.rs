@@ -74,8 +74,6 @@ fn find_table(sig: &[u8; 4]) -> Option<u64> {
     None
 }
 
-<<<<<<< Updated upstream
-=======
 pub fn ecam() -> Option<(u64, u8, u8)> {
     let mcfg = find_table(b"MCFG")?;
     unsafe {
@@ -91,7 +89,6 @@ pub fn ecam() -> Option<(u64, u8, u8)> {
     None
 }
 
->>>>>>> Stashed changes
 pub fn madt() -> Madt {
     let madt = find_table(b"APIC").expect("acpi: no MADT");
     let mut out = Madt {

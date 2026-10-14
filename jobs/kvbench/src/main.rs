@@ -11,10 +11,8 @@ sydon_rt::main!(main);
 
 const GET: u16 = 1;
 const PUT: u16 = 2;
-const MAX_SHARDS: usize = 16;
 const KEYS: u64 = 10_000;
 const OPS: u64 = 200_000;
-// requests in flight at once, so the round trip is not all that is measured
 const WINDOW: usize = 16;
 
 struct Rng(u64);
@@ -29,7 +27,7 @@ impl Rng {
 }
 
 fn main() -> u64 {
-    let shards: Vec<Service> = (0..MAX_SHARDS).map_while(|i| Service::lookup(&format!("kv{}", i)).ok()).collect();
+    let shards: Vec<Service> = (0..16).map_while(|i| Service::lookup(&format!("kv{}", i)).ok()).collect();
     if shards.is_empty() {
         println!("kvbench: no kv shards, try: spawn kv");
         return 1;

@@ -8,12 +8,7 @@ nasm -f bin boot/stage0.asm -o out/stage0.bin
 nasm -f bin boot/stage1.asm -o out/stage1.bin
 nasm -f bin boot/trampoline.asm -o out/trampoline.bin
 
-<<<<<<< Updated upstream
-# the jobs are built into the kernel image, so they come first
-for job in shell hello echod ping ticker fault flood kv kvbench; do
-=======
 for job in shell hello echod ping ticker fault kv kvbench fsbench fswrite fsrand crunch flood yielder flops utils; do
->>>>>>> Stashed changes
     set -- "$@" -p "job-$job"
 done
 # jobs use the hard-float linux target so they get sse and avx. nothing of

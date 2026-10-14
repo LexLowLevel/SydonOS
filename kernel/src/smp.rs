@@ -1,6 +1,7 @@
 use crate::acpi::{Cpus, MAX_CPUS};
 use crate::paging::{self, phys_to_virt, WRITABLE};
 use crate::fabric::{self, Arena};
+use crate::sync::SpinLock;
 use crate::{apic, clock, elf, frame, gdt, heap, idt, pit, rpc, serial, task};
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 

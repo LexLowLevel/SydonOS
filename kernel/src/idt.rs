@@ -62,10 +62,7 @@ global_asm!(
     "ISR_NOERR 128",
     "ISR_NOERR 64",
     "ISR_NOERR 36",
-<<<<<<< Updated upstream
-=======
     "ISR_NOERR 48",
->>>>>>> Stashed changes
     ".global isr_common",
     "isr_common:",
     "push rax",
@@ -118,10 +115,7 @@ global_asm!(
     ".quad isr128",
     ".quad isr64",
     ".quad isr36",
-<<<<<<< Updated upstream
-=======
     ".quad isr48",
->>>>>>> Stashed changes
     ".text",
     dispatch = sym interrupt_dispatch,
 );
@@ -214,11 +208,7 @@ fn init_syscall() {
 }
 
 extern "C" {
-<<<<<<< Updated upstream
-    static isr_stub_table: [u64; 37];
-=======
     static isr_stub_table: [u64; 38];
->>>>>>> Stashed changes
 }
 
 #[repr(C, packed)]
@@ -285,10 +275,7 @@ pub fn init() {
         IDT[0x80] = Gate::user(table[34]);
         IDT[crate::fabric::DOORBELL_VEC as usize] = Gate::new(table[35], 0);
         IDT[crate::console::IRQ_VECTOR as usize] = Gate::new(table[36], 0);
-<<<<<<< Updated upstream
-=======
         IDT[crate::virtio_blk::IRQ_VECTOR as usize] = Gate::new(table[37], 0);
->>>>>>> Stashed changes
     }
     load();
     init_syscall();
@@ -324,14 +311,11 @@ extern "C" fn interrupt_dispatch(frame: *mut Frame) {
             crate::fabric::on_tick();
             crate::task::on_timer();
         }
-<<<<<<< Updated upstream
-=======
         48 => {
             crate::virtio_blk::on_irq();
             crate::apic::eoi();
             crate::task::schedule();
         }
->>>>>>> Stashed changes
         36 => {
             crate::console::on_irq();
             crate::apic::eoi();

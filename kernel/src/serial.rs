@@ -27,8 +27,6 @@ pub struct Tx {
     head: usize,
     len: usize,
     irq: bool,
-<<<<<<< Updated upstream
-=======
     // core + 1 while held, so the lock can be taken back from a dead core
     holder: usize,
 }
@@ -64,7 +62,6 @@ pub fn release_if_held_by(core: usize) {
     if let Some(lock) = queue() {
         unsafe { lock.release_if(|tx| tx.holder == core + 1) };
     }
->>>>>>> Stashed changes
 }
 
 const _: () = assert!(core::mem::size_of::<SpinLock<Tx>>() <= TX_PAGES as usize * 4096);
@@ -154,11 +151,7 @@ impl Write for Out<'_> {
 fn output(f: impl FnOnce(&mut Out)) {
     match queue() {
         Some(lock) => {
-<<<<<<< Updated upstream
-            let mut tx = lock.lock();
-=======
             let mut tx = hold(lock);
->>>>>>> Stashed changes
             f(&mut Out(Some(&mut tx)));
             if tx.irq {
                 tx.fill();
@@ -194,11 +187,7 @@ pub fn _print(args: fmt::Arguments) {
 // before a panic or power off, so the last words get out
 pub fn flush() {
     if let Some(lock) = queue() {
-<<<<<<< Updated upstream
-        lock.lock().drain();
-=======
         hold(lock).drain();
->>>>>>> Stashed changes
     }
 }
 
@@ -213,11 +202,7 @@ pub fn console() -> *mut SpinLock<Tx> {
 
 pub fn enable_irqs() {
     if let Some(lock) = queue() {
-<<<<<<< Updated upstream
-        let mut tx = lock.lock();
-=======
         let mut tx = hold(lock);
->>>>>>> Stashed changes
         tx.irq = true;
         outb(IER, IER_RX | IER_TX);
         tx.fill();
@@ -234,11 +219,7 @@ pub fn on_irq(mut rx: impl FnMut(u8)) {
         match (iir >> 1) & 7 {
             1 => {
                 if let Some(lock) = queue() {
-<<<<<<< Updated upstream
-                    lock.lock().fill();
-=======
                     hold(lock).fill();
->>>>>>> Stashed changes
                 }
             }
             2 | 6 => {

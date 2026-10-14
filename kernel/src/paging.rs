@@ -6,11 +6,8 @@ pub const KERNEL_OFFSET: u64 = 0xFFFF_FFFF_8000_0000;
 pub const PHYSMAP: u64 = 0xFFFF_8000_0000_0000;
 pub const LAPIC_VIRT: u64 = 0xFFFF_FFFF_4000_0000;
 pub const IOAPIC_VIRT: u64 = LAPIC_VIRT + 0x1000;
-<<<<<<< Updated upstream
-=======
 const MMIO_VIRT: u64 = LAPIC_VIRT + 0x1000_0000;
 static MMIO_NEXT: AtomicU64 = AtomicU64::new(MMIO_VIRT);
->>>>>>> Stashed changes
 const LAPIC_PHYS: u64 = 0xFEE0_0000;
 
 pub const HUGE: u64 = 0x20_0000;

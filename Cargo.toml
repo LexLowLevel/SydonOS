@@ -15,15 +15,10 @@ members = [
     "jobs/fsbench",
     "jobs/fswrite",
     "jobs/flood",
-<<<<<<< Updated upstream
-    "jobs/kv",
-    "jobs/kvbench",
-=======
     "jobs/yielder",
     "jobs/flops",
     "jobs/fsrand",
     "jobs/crunch",
->>>>>>> Stashed changes
     "tools/mkimage",
 ]
 resolver = "2"
