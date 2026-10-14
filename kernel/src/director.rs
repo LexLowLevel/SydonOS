@@ -1,6 +1,19 @@
-use crate::rpc::{self, Answer, Body, Packet, Request, Then, DOWN, EXISTS, INVALID, NOT_FOUND, OK};
+use crate::jobs::{self, Class, Traits};
+use alloc::boxed::Box;
+use crate::fabric;
+
+const DRIVERS: [&[u8]; 1] = [b"fs"];
+
+#[derive(Clone, Copy)]
+enum Side {
+    Any,
+    Avoid(usize),
+    Prefer(usize),
+}
+use crate::rpc::{self, Answer, Body, Packet, Request, Then, BUSY, DOWN, EXISTS, INVALID, NOT_FOUND, OK};
 use crate::sync::SpinLock;
-use crate::{fabric, jobs, task};
+use crate::{bufs, task};
+use alloc::string::String;
 use alloc::vec::Vec;
 
 pub const OP_REGISTER: u16 = 1;
@@ -16,12 +29,20 @@ pub const OP_HANG: u16 = 11;
 pub const OP_POWEROFF: u16 = 12;
 pub const OP_IMAGES: u16 = 13;
 pub const OP_KILL: u16 = 14;
+pub const OP_STATS: u16 = 15;
+pub const OP_CRASH: u16 = 16;
+pub const OP_POLL: u16 = 17;
+pub const OP_PARK: u16 = 18;
 
 pub const ANY_CORE: u64 = u64::MAX;
+const NAME_MAX: usize = 24;
 
 const DOWN_TICKS: u64 = crate::clock::ms(1000);
 const CHECK_TICKS: u64 = crate::clock::ms(100);
 const KEEP_EXITED: usize = 32;
+// a core that fails this often within the window stays down
+const RESTARTS_MAX: usize = 3;
+const RESTART_WINDOW: u64 = crate::clock::ms(60_000);
 
 #[derive(Clone, Copy, PartialEq)]
 enum State {
@@ -53,15 +74,29 @@ struct Job {
     pid: u64,
     name: [u8; 16],
     core: usize,
+    class: Class,
     state: State,
     spawn_token: u64,
+    restart: Option<Restart>,
+}
+
+#[derive(Clone)]
+struct Restart {
+    name: Vec<u8>,
+    start: Option<Vec<u8>>,
 }
 
 struct CoreInfo {
     up: bool,
+    cluster: u64,
+    // the physical core; siblings share it
+    phys: u64,
+    parked: bool,
     last_beat: u64,
     last_count: u64,
     jobs: u64,
+    compute: u64,
+    restarts: Vec<u64>,
 }
 
 struct Director {
@@ -92,24 +127,44 @@ fn trimmed(n: &[u8]) -> &[u8] {
 
 pub fn init(cores: usize) {
     let now = task::ticks();
-    let d = Director {
+    let l3_shift = crate::cpu::l3_sharing().next_power_of_two().trailing_zeros();
+    let smt_shift = crate::cpu::smt_shift();
+    let mut d = Director {
         registry: Vec::new(),
         jobs: Vec::new(),
-        cores: (0..cores).map(|_| CoreInfo { up: true, last_beat: now, last_count: 0, jobs: 0 }).collect(),
+        cores: (0..cores)
+            .map(|c| CoreInfo {
+                up: true,
+                cluster: (fabric::apic_id(c) as u32 >> l3_shift) as u64,
+                phys: (fabric::apic_id(c) as u32 >> smt_shift) as u64,
+                parked: false,
+                last_beat: now,
+                last_count: 0,
+                jobs: 0,
+                compute: 0,
+                restarts: Vec::new(),
+            })
+            .collect(),
         waiters: Vec::new(),
         next_pid: 1,
         next_check: 0,
     };
+    d.registry.push(Entry { name: name32(b"director"), handle: rpc::handle(0, rpc::SVC_DIRECTOR) });
+    d.registry.push(Entry { name: name32(b"console"), handle: rpc::handle(0, rpc::SVC_CONSOLE) });
     *DIRECTOR.lock() = Some(d);
     rpc::register_kernel(rpc::SVC_DIRECTOR, handler);
+<<<<<<< Updated upstream
     with(|d| {
         d.registry.push(Entry { name: name32(b"director"), handle: rpc::handle(0, rpc::SVC_DIRECTOR) });
         d.registry.push(Entry { name: name32(b"console"), handle: rpc::handle(0, rpc::SVC_CONSOLE) });
     });
+=======
+>>>>>>> Stashed changes
 }
 
 impl Director {
-    fn place(&self, needs: &str, requested: u64) -> Result<usize, u8> {
+    // on ties an io job keeps the service's core free, an io latency job takes it
+    fn place(&self, traits: &Traits, requested: u64) -> Result<usize, u8> {
         if requested != ANY_CORE {
             let c = requested as usize;
             return match self.cores.get(c) {
@@ -118,21 +173,71 @@ impl Director {
                 None => Err(INVALID),
             };
         }
-        let key = name32(needs.as_bytes());
-        if let Some(e) = self.registry.iter().find(|e| !needs.is_empty() && e.name == key) {
-            return Ok(rpc::handle_core(e.handle));
+        if let Some(needs) = traits.needs() {
+            let key = name32(needs);
+            if let Some(e) = self.registry.iter().find(|e| e.name == key) {
+                let home = rpc::handle_core(e.handle);
+                let cluster = self.cores[home].cluster;
+                let side = match traits.class {
+                    Class::Io => Side::Avoid(home),
+                    Class::IoLatency => Side::Prefer(home),
+                    _ => Side::Any,
+                };
+                return Ok(self.least_loaded(|c| c.cluster == cluster, traits.class, side).unwrap_or(home));
+            }
         }
-        // core 0 counts one extra job for the director
+        self.least_loaded(|_| true, traits.class, Side::Any).ok_or(DOWN)
+    }
+
+    // core 0 counts one extra job for the director and console. a core that
+    // owns a driver counts extra for everything but io jobs. siblings share one
+    // core's units, so a compute job looks at the whole physical core, where
+    // other compute jobs count three times since they never leave it idle.
+    // other jobs only count the compute jobs on the siblings.
+    fn weight(&self, core: usize, class: Class) -> u64 {
+        let driver = self
+            .registry
+            .iter()
+            .any(|e| DRIVERS.iter().any(|d| e.name == name32(d)) && rpc::handle_core(e.handle) == core);
+        let extra = match (driver, class) {
+            (false, _) | (true, Class::Io | Class::IoLatency) => 0,
+            (true, Class::Other) => 1,
+            (true, Class::Compute) => 2,
+        };
+        let phys = self.cores[core].phys;
+        let shared: u64 = (0..self.cores.len())
+            .filter(|&s| self.cores[s].up && self.cores[s].phys == phys)
+            .map(|s| {
+                let c = &self.cores[s];
+                match class {
+                    Class::Compute => 2 * c.compute + if s == core { 0 } else { c.jobs + (s == 0) as u64 },
+                    _ if s == core => 0,
+                    _ => c.compute,
+                }
+            })
+            .sum();
+        self.cores[core].jobs + (core == 0) as u64 + extra + shared
+    }
+
+    fn least_loaded(&self, fits: impl Fn(&CoreInfo) -> bool, class: Class, side: Side) -> Option<usize> {
         (0..self.cores.len())
-            .filter(|&c| self.cores[c].up)
-            .min_by_key(|&c| (self.cores[c].jobs + (c == 0) as u64, c))
-            .ok_or(DOWN)
+            .filter(|&c| self.cores[c].up && !self.cores[c].parked && fits(&self.cores[c]))
+            .min_by_key(|&c| {
+                let tie = match side {
+                    Side::Avoid(h) => c == h,
+                    Side::Prefer(h) => c != h,
+                    Side::Any => false,
+                };
+                (self.weight(c, class), tie, c)
+            })
     }
 
     fn finish_job(&mut self, pid: u64, state: State) -> Vec<u64> {
         if let Some(job) = self.jobs.iter_mut().find(|j| j.pid == pid) {
             if matches!(job.state, State::Starting | State::Running) {
-                self.cores[job.core].jobs -= 1;
+                let c = &mut self.cores[job.core];
+                c.jobs -= 1;
+                c.compute -= (job.class == Class::Compute) as u64;
             }
             job.state = state;
         }
@@ -156,23 +261,72 @@ fn wait_answer(state: State) -> (u8, Body) {
     }
 }
 
-// token 0 means nobody gets a reply
-pub fn spawn(name: &[u8], requested: u64, token: u64) -> Result<(), u8> {
-    let job = jobs::builtin(name).ok_or(NOT_FOUND)?;
+pub fn spawn(name: &[u8], requested: u64, token: u64, start: Option<u64>) -> Result<(), u8> {
+    let out = try_spawn(name, requested, token, start);
+    if out.is_err() {
+        start.map(bufs::free);
+    }
+    out
+}
+
+fn try_spawn(name: &[u8], requested: u64, token: u64, start: Option<u64>) -> Result<(), u8> {
+    if jobs::basename(name).is_empty() || name.len() > NAME_MAX {
+        return Err(INVALID);
+    }
+    if let Some(b) = jobs::builtin(name) {
+        return spawn_as(name, b.traits, requested, token, start);
+    }
+    let probe = Box::into_raw(Box::new(Probe { name: name.to_vec(), requested, token, start }));
+    if task::spawn(probe_task, probe as u64, false).is_none() {
+        drop(unsafe { Box::from_raw(probe) });
+        return Err(BUSY);
+    }
+    Ok(())
+}
+
+struct Probe {
+    name: Vec<u8>,
+    requested: u64,
+    token: u64,
+    start: Option<u64>,
+}
+
+fn probe_task(arg: u64) {
+    let p = unsafe { Box::from_raw(arg as *mut Probe) };
+    let status = match crate::user::image(&jobs::path(&p.name)) {
+        Ok(image) => spawn_as(&p.name, jobs::manifest(&image[..image.len().min(jobs::MANIFEST_SCAN)]), p.requested, p.token, p.start).err(),
+        Err(status) => Some(status),
+    };
+    if let Some(status) = status {
+        p.start.map(bufs::free);
+        rpc::reply(p.token, status, Body::EMPTY);
+    }
+}
+
+// on an error `start` is still the caller's
+fn spawn_as(name: &[u8], traits: Traits, requested: u64, token: u64, start: Option<u64>) -> Result<(), u8> {
+    let base = jobs::basename(name);
     let (pid, core) = with(|d| {
-        let core = d.place(job.needs, requested)?;
+        let core = d.place(&traits, requested)?;
         let pid = d.next_pid;
         d.next_pid += 1;
         let mut short = [0u8; 16];
-        let n = name.len().min(16);
-        short[..n].copy_from_slice(&name[..n]);
-        d.jobs.push(Job { pid, name: short, core, state: State::Starting, spawn_token: token });
+        let n = base.len().min(16);
+        short[..n].copy_from_slice(&base[..n]);
+        let restart = traits.restart.then(|| Restart { name: name.to_vec(), start: start.map(start_copy) });
+        d.jobs.push(Job { pid, name: short, core, class: traits.class, state: State::Starting, spawn_token: token, restart });
         d.cores[core].jobs += 1;
+        d.cores[core].compute += (traits.class == Class::Compute) as u64;
         Ok::<_, u8>((pid, core))
     })?;
     let mut body = Body::words(&[pid]);
-    body.set_name(8, 32, name);
-    if let Err(status) = rpc::submit(rpc::handle(core, rpc::SVC_CORE), rpc::CORE_LOAD, body, Then::Call(loaded, pid)) {
+    body.set_name(8, NAME_MAX, name);
+    let h = rpc::handle(core, rpc::SVC_CORE);
+    let sent = match start {
+        Some(buf) => rpc::submit_buf(h, rpc::CORE_LOAD, body, buf, Then::Call(loaded, pid)),
+        None => rpc::submit(h, rpc::CORE_LOAD, body, Then::Call(loaded, pid)),
+    };
+    if let Err(status) = sent {
         with(|d| d.finish_job(pid, State::Failed));
         return Err(status);
     }
@@ -194,7 +348,7 @@ fn loaded(pid: u64, pkt: &Packet) {
     })
     .unwrap_or((0, 0, Vec::new()));
     if pkt.status == OK {
-        rpc::reply(token, OK, Body::words(&[pid, core as u64]));
+        rpc::reply(token, OK, Body::words(&[pid, core as u64, pkt.body.word(0), pkt.body.word(1)]));
     } else {
         rpc::reply(token, pkt.status, Body::EMPTY);
     }
@@ -203,8 +357,39 @@ fn loaded(pid: u64, pkt: &Packet) {
     }
 }
 
+<<<<<<< Updated upstream
 fn kernel_only(op: u16) -> bool {
     matches!(op, OP_REGISTER | OP_UNREGISTER | OP_EXITED)
+=======
+fn power_off(_: u64, _: &Packet) {
+    rpc::oneway(rpc::handle(0, rpc::SVC_CORE), rpc::CORE_POWEROFF, Body::EMPTY);
+}
+
+fn forward(token: u64, pkt: &Packet) {
+    rpc::reply(token, pkt.status, pkt.body);
+}
+
+fn kernel_only(op: u16) -> bool {
+    matches!(op, OP_REGISTER | OP_UNREGISTER | OP_EXITED)
+}
+
+fn privileged_only(op: u16) -> bool {
+    matches!(op, OP_HANG | OP_POWEROFF | OP_KILL | OP_CRASH | OP_POLL | OP_PARK)
+}
+
+// pipes die with the core, so a restarted job gets nothing in their place
+fn start_copy(buf: u64) -> Vec<u8> {
+    let b = crate::bufs::bytes(buf);
+    let len = (u32::from_le_bytes(b[8..12].try_into().unwrap()) as usize).clamp(88, 4096);
+    let mut start = b[..len].to_vec();
+    for i in 0..3 {
+        let kind = &mut start[16 + 24 * i];
+        if matches!(*kind, 1 | 2 | 4) {
+            *kind = 5;
+        }
+    }
+    start
+>>>>>>> Stashed changes
 }
 
 // the shell is the only job trusted with these
@@ -216,7 +401,11 @@ fn privileged_only(op: u16) -> bool {
 pub fn kill(pid: u64) -> u8 {
     let target = with(|d| {
         let j = d.jobs.iter().find(|j| j.pid == pid && matches!(j.state, State::Starting | State::Running))?;
+<<<<<<< Updated upstream
         let privileged = jobs::builtin(trimmed(&j.name)).is_some_and(|b| b.privileged);
+=======
+        let privileged = jobs::builtin(trimmed(&j.name)).is_some_and(|b| b.traits.privileged);
+>>>>>>> Stashed changes
         Some((j.core, privileged))
     });
     match target {
@@ -264,7 +453,7 @@ fn handler(req: &Request) -> Answer {
             }
             None => Answer::Reply(NOT_FOUND, Body::EMPTY),
         }),
-        OP_SPAWN => match spawn(b.name_at(8, 32), b.word(0), req.token) {
+        OP_SPAWN => match spawn(b.name_at(8, NAME_MAX), b.word(0), req.token, req.buf()) {
             Ok(()) => Answer::Later,
             Err(status) => Answer::Reply(status, Body::EMPTY),
         },
@@ -306,31 +495,77 @@ fn handler(req: &Request) -> Answer {
                     let local = b.word(0) == 0;
                     let age = if local { 0 } else { now.saturating_sub(c.last_beat) * crate::clock::TICK_US / 1000 };
                     let free = if local { crate::frame::total_free() * 4 } else { fabric::beat_of(b.word(0) as usize).1 };
-                    Answer::Reply(OK, Body::words(&[c.up as u64, c.jobs, age, free]))
+                    Answer::Reply(OK, Body::words(&[c.up as u64 | (c.parked as u64) << 1, c.jobs, age, free, c.cluster | c.phys << 32]))
                 }
                 None => Answer::Reply(NOT_FOUND, Body::EMPTY),
             })
         }
-        OP_HANG => {
+        // w0 core, w1 0 always, 1 adaptive, 2 never
+        OP_POLL => {
+            let core = b.word(0) as usize;
+            if core >= with(|d| d.cores.len()) || b.word(1) > 2 {
+                return Answer::Reply(INVALID, Body::EMPTY);
+            }
+            rpc::oneway(rpc::handle(core, rpc::SVC_CORE), rpc::CORE_POLL, Body::words(&[b.word(1)]));
+            Answer::Reply(OK, Body::EMPTY)
+        }
+        // w0 core, w1 1 to park, 0 to take it back. a parked core gets no new
+        // jobs unless asked for by number, and sleeps instead of polling so its
+        // sibling has the whole core.
+        OP_PARK => {
+            let core = b.word(0) as usize;
+            if core == 0 || core >= with(|d| d.cores.len()) || b.word(1) > 1 {
+                return Answer::Reply(INVALID, Body::EMPTY);
+            }
+            let park = b.word(1) == 1;
+            with(|d| d.cores[core].parked = park);
+            let mode = if park { fabric::Poll::Never } else { fabric::Poll::Adaptive };
+            rpc::oneway(rpc::handle(core, rpc::SVC_CORE), rpc::CORE_POLL, Body::words(&[mode as u64]));
+            Answer::Reply(OK, Body::EMPTY)
+        }
+        OP_HANG | OP_CRASH => {
             let core = b.word(0) as usize;
             if core == 0 || core >= with(|d| d.cores.len()) {
                 return Answer::Reply(INVALID, Body::EMPTY);
             }
-            rpc::oneway(rpc::handle(core, rpc::SVC_CORE), rpc::CORE_HANG, Body::EMPTY);
+            let op = if req.op == OP_HANG { rpc::CORE_HANG } else { rpc::CORE_CRASH };
+            rpc::oneway(rpc::handle(core, rpc::SVC_CORE), op, Body::EMPTY);
             Answer::Reply(OK, Body::EMPTY)
         }
         OP_KILL => Answer::Reply(kill(b.word(0)), Body::EMPTY),
+<<<<<<< Updated upstream
+=======
+        OP_STATS => {
+            let h = rpc::handle(b.word(0) as usize, rpc::SVC_CORE);
+            match rpc::submit(h, rpc::CORE_STATS, Body::EMPTY, Then::Call(forward, req.token)) {
+                Ok(_) => Answer::Later,
+                Err(status) => Answer::Reply(status, Body::EMPTY),
+            }
+        }
+>>>>>>> Stashed changes
         OP_IMAGES => match jobs::BUILTIN.get(b.word(0) as usize) {
             Some(job) => {
                 let mut out = Body::EMPTY;
                 out.set_name(0, 16, job.name.as_bytes());
+<<<<<<< Updated upstream
                 out.set_name(16, 24, job.needs.as_bytes());
+=======
+                out.set_name(16, 24, job.traits.needs().unwrap_or(b""));
+>>>>>>> Stashed changes
                 Answer::Reply(OK, out)
             }
             None => Answer::Reply(NOT_FOUND, Body::EMPTY),
         },
         OP_POWEROFF => {
+<<<<<<< Updated upstream
             rpc::oneway(rpc::handle(0, rpc::SVC_CORE), rpc::CORE_POWEROFF, Body::EMPTY);
+=======
+            let fs = with(|d| d.registry.iter().find(|e| e.name == name32(b"fs")).map(|e| e.handle));
+            let synced = fs.map(|h| rpc::submit(h, crate::fs::OP_SYNC, Body::EMPTY, Then::Call(power_off, 0)));
+            if !matches!(synced, Some(Ok(_))) {
+                rpc::oneway(rpc::handle(0, rpc::SVC_CORE), rpc::CORE_POWEROFF, Body::EMPTY);
+            }
+>>>>>>> Stashed changes
             Answer::Reply(OK, Body::EMPTY)
         }
         _ => Answer::Reply(INVALID, Body::EMPTY),
@@ -346,7 +581,9 @@ pub fn tick(now: u64) {
         let mut silent = Vec::new();
         for (core, c) in d.cores.iter_mut().enumerate().skip(1).filter(|(_, c)| c.up) {
             let (count, _) = fabric::beat_of(core);
-            if count != c.last_count {
+            if count == fabric::DEAD {
+                silent.push(core);
+            } else if count != c.last_count {
                 c.last_count = count;
                 c.last_beat = now;
             } else if now.saturating_sub(c.last_beat) > DOWN_TICKS {
@@ -361,28 +598,103 @@ pub fn tick(now: u64) {
 }
 
 fn mark_down(core: usize) {
-    let (waiters, others) = with(|d| {
+    // stopped first, so a half alive kernel cannot touch the rings any more
+    crate::smp::stop(core);
+    let (waiters, jobs) = with(|d| {
         d.cores[core].up = false;
         d.registry.retain(|e| rpc::handle_core(e.handle) != core);
-        let lost: Vec<u64> = d
+        let lost: Vec<(u64, Option<Restart>)> = d
             .jobs
             .iter()
             .filter(|j| j.core == core && matches!(j.state, State::Starting | State::Running))
-            .map(|j| j.pid)
+            .map(|j| (j.pid, j.restart.clone()))
             .collect();
         let mut waiters = Vec::new();
-        for pid in lost {
+        for &(pid, _) in &lost {
             waiters.extend(d.finish_job(pid, State::Lost));
         }
-        let others: Vec<usize> = (1..d.cores.len()).filter(|&c| c != core && d.cores[c].up).collect();
-        (waiters, others)
+        (waiters, lost.into_iter().filter_map(|(_, r)| r).collect())
     });
     println!("director: cpu {} stopped answering, marked down", core);
     for t in waiters {
         rpc::reply(t, DOWN, Body::EMPTY);
     }
     rpc::peer_down(core);
-    for c in others {
-        rpc::oneway(rpc::handle(c, rpc::SVC_CORE), rpc::CORE_PEER_DOWN, Body::words(&[core as u64]));
+    let rescue = Box::into_raw(Box::new(Rescue { core, jobs }));
+    if task::spawn(rescue_task, rescue as u64, true).is_none() {
+        drop(unsafe { Box::from_raw(rescue) });
+        println!("director: no task to bring cpu {} back", core);
     }
 }
+<<<<<<< Updated upstream
+=======
+
+struct Rescue {
+    core: usize,
+    jobs: Vec<Restart>,
+}
+
+static RESCUING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+// every other core lets go of the dead one before its rings are cleared and
+// it boots again. one rescue at a time, they share the boot page.
+fn rescue_task(arg: u64) {
+    let Rescue { core, jobs } = *unsafe { Box::from_raw(arg as *mut Rescue) };
+    while RESCUING.swap(true, core::sync::atomic::Ordering::Acquire) {
+        task::sleep_until(task::ticks() + crate::clock::ms(10));
+    }
+    let others: Vec<usize> = with(|d| (1..d.cores.len()).filter(|&c| c != core && d.cores[c].up).collect());
+    let body = Body::words(&[core as u64]);
+    for &c in &others {
+        let p = rpc::call(rpc::handle(c, rpc::SVC_CORE), rpc::CORE_PEER_DOWN, body);
+        if p.status != OK {
+            println!("director: cpu {} did not let go of cpu {} (status {})", c, core, p.status);
+        }
+    }
+    let now = task::ticks();
+    let allowed = with(|d| {
+        let r = &mut d.cores[core].restarts;
+        r.retain(|&t| now.saturating_sub(t) < RESTART_WINDOW);
+        r.push(now);
+        r.len() <= RESTARTS_MAX
+    });
+    let back = allowed && {
+        fabric::clear_rings(core);
+        crate::smp::restart(core)
+    };
+    if back {
+        rpc::peer_up(core);
+        for &c in &others {
+            rpc::call(rpc::handle(c, rpc::SVC_CORE), rpc::CORE_PEER_UP, body);
+        }
+        with(|d| {
+            let c = &mut d.cores[core];
+            c.up = true;
+            c.last_beat = task::ticks();
+            c.last_count = 0;
+            c.jobs = 0;
+            c.compute = 0;
+        });
+        println!("director: cpu {} is back", core);
+    } else if allowed {
+        println!("director: cpu {} did not come back", core);
+    } else {
+        println!("director: cpu {} failed {} times in a minute, leaving it down", core, RESTARTS_MAX + 1);
+    }
+    RESCUING.store(false, core::sync::atomic::Ordering::Release);
+    if !back {
+        return;
+    }
+    for job in jobs {
+        let start = job.start.as_ref().and_then(|s| {
+            let buf = crate::bufs::alloc()?;
+            crate::bufs::bytes(buf)[..s.len()].copy_from_slice(s);
+            Some(buf)
+        });
+        match spawn(&job.name, core as u64, 0, start) {
+            Ok(()) => println!("director: starting {} again on cpu {}", String::from_utf8_lossy(&job.name), core),
+            Err(status) => println!("director: could not restart {} (status {})", String::from_utf8_lossy(&job.name), status),
+        }
+    }
+}
+>>>>>>> Stashed changes

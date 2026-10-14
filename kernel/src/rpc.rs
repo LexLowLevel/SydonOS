@@ -10,6 +10,11 @@ pub const PAYLOAD: usize = 40;
 pub const SVC_CORE: u16 = 0;
 pub const SVC_DIRECTOR: u16 = 1;
 pub const SVC_CONSOLE: u16 = 2;
+<<<<<<< Updated upstream
+=======
+pub const SVC_FS: u16 = 3;
+pub const SVC_PIPE: u16 = 4;
+>>>>>>> Stashed changes
 const FIRST_USER_SVC: u16 = 16;
 
 // reply status, the same numbers user space sees
@@ -22,13 +27,21 @@ pub const INVALID: u8 = 5;
 pub const DOWN: u8 = 6;
 pub const NO_MEMORY: u8 = 7;
 pub const BUSY: u8 = 8;
+pub const CLOSED: u8 = 9;
+pub const NOT_EMPTY: u8 = 10;
+pub const FULL: u8 = 11;
 
 pub const ONEWAY: u8 = 1;
 pub const MORE: u8 = 2;
 // only kernels set this, SYS_SUBMIT never does
 const FROM_KERNEL: u8 = 4;
+<<<<<<< Updated upstream
 // set by the kernel on requests from the shell
 const PRIVILEGED: u8 = 8;
+=======
+const PRIVILEGED: u8 = 8;
+const BUF: u8 = 16;
+>>>>>>> Stashed changes
 
 const REQUEST: u8 = 1;
 const REPLY: u8 = 2;
@@ -38,6 +51,11 @@ pub const CORE_HANG: u16 = 2;
 pub const CORE_PEER_DOWN: u16 = 3;
 pub const CORE_POWEROFF: u16 = 4;
 pub const CORE_KILL: u16 = 5;
+pub const CORE_BUF_FREE: u16 = 7;
+pub const CORE_STATS: u16 = 6;
+pub const CORE_PEER_UP: u16 = 8;
+pub const CORE_CRASH: u16 = 9;
+pub const CORE_POLL: u16 = 10;
 
 pub const DEFAULT_TIMEOUT: u64 = clock::ms(3000);
 pub const NEVER: u64 = u64::MAX;
@@ -118,7 +136,7 @@ pub struct Packet {
 }
 
 impl Packet {
-    pub fn status_only(status: u8) -> Packet {
+    fn status_only(status: u8) -> Packet {
         Packet { kind: REPLY, flags: 0, status, service: 0, op: 0, id: 0, body: Body::EMPTY }
     }
 
@@ -192,6 +210,14 @@ impl Request {
     pub fn privileged(&self) -> bool {
         self.flags & (FROM_KERNEL | PRIVILEGED) != 0
     }
+<<<<<<< Updated upstream
+=======
+
+    // the buffer that came with the request, now owned by whoever serves it
+    pub fn buf(&self) -> Option<u64> {
+        (self.flags & BUF != 0 && crate::bufs::valid(self.body.word(4))).then(|| self.body.word(4))
+    }
+>>>>>>> Stashed changes
 }
 
 pub enum Answer {
@@ -245,6 +271,7 @@ struct Rpc {
     outbox: VecDeque<(usize, Msg)>,
     cache: Vec<([u8; 32], u64)>,
     down: u64,
+    bufs: Vec<(usize, u64)>,
     next_beat: u64,
     dirty: u64,
     batching: u32,
@@ -276,12 +303,18 @@ pub fn init() {
         outbox: VecDeque::new(),
         cache: Vec::new(),
         down: 0,
+        bufs: Vec::new(),
         next_beat: 0,
         dirty: 0,
         batching: 0,
     });
     RPC.with(|r| *r = rpc);
     register_kernel(SVC_CORE, core_service);
+    register_kernel(SVC_PIPE, crate::pipe::handler);
+}
+
+pub fn outbox_len() -> usize {
+    with(|r| r.outbox.len())
 }
 
 pub fn register_kernel(id: u16, f: KernelHandler) {
@@ -303,11 +336,17 @@ impl Rpc {
     // a full ring sends later messages to that core through the outbox too, so
     // they keep their order
     fn send(&mut self, dst: usize, pkt: &Packet) {
+        if pkt.flags & BUF != 0 {
+            crate::bufs::lend(pkt.body.word(4), dst);
+        }
         let msg = pkt.encode();
         if dst >= self.cores {
             return;
         }
         if dst == self.me {
+            if self.deliver_local(pkt) {
+                return;
+            }
             self.local.push_back(msg);
             wake_executor();
             return;
@@ -322,6 +361,44 @@ impl Rpc {
         }
         self.outbox.push_back((dst, msg));
         wake_executor();
+    }
+
+    // a request for a job's service or a reply to a waiting task on this core
+    // needs nothing from the executor, so it skips the local queue. anything
+    // else, like a kernel service or a callback, still goes the long way.
+    fn deliver_local(&mut self, pkt: &Packet) -> bool {
+        match pkt.kind {
+            REQUEST => {
+                let token = if pkt.flags & ONEWAY != 0 { 0 } else { token_of(self.me, pkt.id) };
+                let Some(s) = self.services.iter_mut().find(|s| s.id == pkt.service) else {
+                    return false;
+                };
+                let Handler::User { task, queue, waiting, .. } = &mut s.handler else {
+                    return false;
+                };
+                if queue.len() >= QUEUE_MAX {
+                    return false;
+                }
+                queue.push_back((token, pkt.op, pkt.body));
+                let t = *task;
+                if core::mem::take(waiting) {
+                    task::wake(t);
+                }
+                if pkt.flags & BUF != 0 && crate::bufs::valid(pkt.body.word(4)) {
+                    self.bufs.push((t, pkt.body.word(4)));
+                }
+                true
+            }
+            REPLY => {
+                let local = |p: &Pending| p.reply.is_none() && handle_core(p.handle) == self.me && matches!(p.then, Then::Task(_));
+                let Some(i) = self.slot_of(pkt.id).filter(|&i| local(self.pending[i].as_ref().unwrap())) else {
+                    return false;
+                };
+                deliver(self, i, *pkt);
+                true
+            }
+            _ => false,
+        }
     }
 
     fn ring(&mut self) {
@@ -396,8 +473,26 @@ pub fn submit_timeout(h: u64, op: u16, body: Body, then: Then, ticks: u64) -> Re
     })
 }
 
+<<<<<<< Updated upstream
 pub fn submit_user(h: u64, op: u16, body: Body, then: Then, ticks: u64, privileged: bool) -> Result<u64, u8> {
     let flags = if privileged { PRIVILEGED } else { 0 };
+=======
+pub fn submit_buf(h: u64, op: u16, mut body: Body, buf: u64, then: Then) -> Result<u64, u8> {
+    body.set_word(4, buf);
+    with(|r| {
+        let id = r.submit(h, op, body, FROM_KERNEL | BUF, Some((then, DEFAULT_TIMEOUT)));
+        r.ring();
+        id
+    })
+}
+
+pub fn submit_user(h: u64, op: u16, mut body: Body, then: Then, ticks: u64, privileged: bool, buf: Option<u64>) -> Result<u64, u8> {
+    let mut flags = if privileged { PRIVILEGED } else { 0 };
+    if let Some(b) = buf {
+        body.set_word(4, b);
+        flags |= BUF;
+    }
+>>>>>>> Stashed changes
     with(|r| {
         if matches!(then, Then::Task(t) if r.open[t] >= OPEN_MAX) {
             return Err(BUSY);
@@ -434,10 +529,24 @@ pub fn batch<R>(f: impl FnOnce() -> R) -> R {
 }
 
 pub fn reply(token: u64, status: u8, body: Body) {
+    send_reply(token, status, body, 0);
+}
+
+// the buffer belongs to the receiver from here on
+pub fn reply_buf(token: u64, status: u8, mut body: Body, buf: u64) {
+    if token == 0 {
+        crate::bufs::free(buf);
+        return;
+    }
+    body.set_word(4, buf);
+    send_reply(token, status, body, BUF);
+}
+
+fn send_reply(token: u64, status: u8, body: Body, flags: u8) {
     if token == 0 {
         return;
     }
-    let pkt = Packet { kind: REPLY, flags: 0, status, service: 0, op: 0, id: token & 0xFFFF_FFFF_FFFF, body };
+    let pkt = Packet { kind: REPLY, flags, status, service: 0, op: 0, id: token & 0xFFFF_FFFF_FFFF, body };
     with(|r| {
         r.send(token_core(token), &pkt);
         r.ring();
@@ -516,6 +625,9 @@ pub fn call(h: u64, op: u16, body: Body) -> Packet {
 fn deliver(r: &mut Rpc, i: usize, pkt: Packet) -> Option<(fn(u64, &Packet), u64)> {
     match r.at(i).then {
         Then::Task(t) => {
+            if pkt.flags & BUF != 0 && crate::bufs::valid(pkt.body.word(4)) {
+                r.bufs.push((t, pkt.body.word(4)));
+            }
             r.at(i).reply = Some(pkt);
             if r.at(i).waiting {
                 task::wake(t);
@@ -531,10 +643,19 @@ fn deliver(r: &mut Rpc, i: usize, pkt: Packet) -> Option<(fn(u64, &Packet), u64)
 
 // a reply must come from the core the request went to
 fn complete(src: usize, id: u64, pkt: Packet) {
-    let call = with(|r| {
+    let found = with(|r| {
         let i = r.slot_of(id).filter(|&i| r.at(i).reply.is_none() && handle_core(r.at(i).handle) == src)?;
-        deliver(r, i, pkt)
+        Some(deliver(r, i, pkt))
     });
+    let call = match found {
+        Some(call) => call,
+        None => {
+            if pkt.flags & BUF != 0 && crate::bufs::valid(pkt.body.word(4)) {
+                crate::bufs::free(pkt.body.word(4));
+            }
+            None
+        }
+    };
     if let Some((f, ctx)) = call {
         f(ctx, &pkt);
     }
@@ -556,7 +677,9 @@ fn fail_where(status: u8, pred: impl Fn(&Pending) -> bool) {
     }
 }
 
+// forgets everything that involves `core`, so it can come back as a new kernel
 pub fn peer_down(core: usize) {
+    fabric::disconnect(core);
     with(|r| {
         if core < 64 {
             r.down |= 1 << core;
@@ -569,8 +692,20 @@ pub fn peer_down(core: usize) {
                 open.retain(|&t| token_core(t) != core);
             }
         }
+        // its pool starts over when it comes back
+        r.bufs.retain(|&(_, b)| crate::bufs::origin_of(b) != core);
     });
+    crate::bufs::reclaim(core);
     fail_where(DOWN, |p| handle_core(p.handle) == core);
+}
+
+pub fn peer_up(core: usize) {
+    with(|r| {
+        if core < 64 {
+            r.down &= !(1 << core);
+        }
+    });
+    fabric::connect(core);
 }
 
 pub fn lookup(name: &[u8]) -> Result<u64, u8> {
@@ -677,9 +812,30 @@ pub fn svc_reply(task: usize, token: u64, status: u8, body: Body) -> Result<(), 
     Ok(())
 }
 
-// owed requests get NO_SERVICE. returns the task's service handles.
+// takes a buffer the task was handed, so nobody else can use its handle
+pub fn take_buf(task: usize, buf: u64) -> bool {
+    with(|r| match r.bufs.iter().position(|&(t, b)| t == task && b == buf) {
+        Some(i) => {
+            r.bufs.swap_remove(i);
+            true
+        }
+        None => false,
+    })
+}
+
 pub fn drop_task(task: usize) -> Vec<u64> {
     let console = handle(0, SVC_CONSOLE);
+<<<<<<< Updated upstream
+=======
+    let held: Vec<u64> = with(|r| {
+        let held = r.bufs.iter().filter(|&&(t, _)| t == task).map(|&(_, b)| b).collect();
+        r.bufs.retain(|&(t, _)| t != task);
+        held
+    });
+    for b in held {
+        crate::bufs::free(b);
+    }
+>>>>>>> Stashed changes
     let (gone, owed, reads) = with(|r| {
         let mut reads = Vec::new();
         for i in 0..r.pending.len() {
@@ -743,6 +899,9 @@ fn serve(src: usize, pkt: Packet) {
             Handler::User { queue, .. } if queue.len() >= QUEUE_MAX => Err(BUSY),
             Handler::User { task, queue, waiting, .. } => {
                 queue.push_back((req.token, req.op, req.body));
+                if let Some(b) = req.buf() {
+                    r.bufs.push((*task, b));
+                }
                 if *waiting {
                     *waiting = false;
                     task::wake(*task);
@@ -751,6 +910,11 @@ fn serve(src: usize, pkt: Packet) {
             }
         }
     });
+    if kernel.is_err() {
+        if let Some(b) = req.buf() {
+            crate::bufs::free(b);
+        }
+    }
     match kernel {
         Ok(Some(f)) => {
             if let Answer::Reply(status, body) = f(&req) {
@@ -767,7 +931,7 @@ fn core_service(req: &Request) -> Answer {
         return Answer::Reply(INVALID, Body::EMPTY);
     }
     match req.op {
-        CORE_LOAD => user::load_job(req.body.word(0), req.body.name_at(8, 32)),
+        CORE_LOAD => user::load_job(req.body.word(0), req.body.name_at(8, 24), req.token, req.buf()),
         CORE_HANG => {
             println!("cpu {}: told to hang, stopping", smp::core());
             cpu::cli();
@@ -777,6 +941,38 @@ fn core_service(req: &Request) -> Answer {
             peer_down(req.body.word(0) as usize);
             Answer::Reply(OK, Body::EMPTY)
         }
+<<<<<<< Updated upstream
+        CORE_POWEROFF => {
+            println!("cpu {}: power off", smp::core());
+            crate::serial::flush();
+            // the q35 ACPI power management block, where QEMU listens for S5
+            cpu::outw(0x604, 0x2000);
+            Answer::Reply(INVALID, Body::EMPTY)
+=======
+        CORE_PEER_UP => {
+            peer_up(req.body.word(0) as usize);
+            Answer::Reply(OK, Body::EMPTY)
+        }
+        CORE_CRASH => panic!("told to crash"),
+        CORE_POLL => {
+            let p = match req.body.word(0) {
+                0 => fabric::Poll::Always,
+                2 => fabric::Poll::Never,
+                _ => fabric::Poll::Adaptive,
+            };
+            fabric::set_policy(p);
+            Answer::Reply(OK, Body::EMPTY)
+        }
+        CORE_STATS => Answer::Reply(OK, Body::words(&crate::stats::snapshot())),
+        CORE_BUF_FREE => {
+            crate::bufs::free_local(req.body.word(0));
+            Answer::Reply(OK, Body::EMPTY)
+>>>>>>> Stashed changes
+        }
+        CORE_KILL => match user::kill(req.body.word(0)) {
+            true => Answer::Reply(OK, Body::EMPTY),
+            false => Answer::Reply(NOT_FOUND, Body::EMPTY),
+        },
         CORE_POWEROFF => {
             println!("cpu {}: power off", smp::core());
             crate::serial::flush();
@@ -784,10 +980,6 @@ fn core_service(req: &Request) -> Answer {
             cpu::outw(0x604, 0x2000);
             Answer::Reply(INVALID, Body::EMPTY)
         }
-        CORE_KILL => match user::kill(req.body.word(0)) {
-            true => Answer::Reply(OK, Body::EMPTY),
-            false => Answer::Reply(NOT_FOUND, Body::EMPTY),
-        },
         _ => Answer::Reply(INVALID, Body::EMPTY),
     }
 }
@@ -849,7 +1041,11 @@ fn next_wake(now: u64) -> u64 {
 // interrupts stay off from the queue check until the task blocks
 fn sleep(until: u64) {
     let flags = cpu::push_cli();
+<<<<<<< Updated upstream
     let busy = with(|r| !r.local.is_empty()) || console::input_pending();
+=======
+    let busy = with(|r| !r.local.is_empty()) || console::input_pending() || crate::virtio_blk::pending();
+>>>>>>> Stashed changes
     if !busy {
         WAKE_AT.store(until, Ordering::Relaxed);
         fabric::wait(!active());
@@ -907,7 +1103,11 @@ fn pump() -> usize {
 }
 
 fn work_waiting() -> bool {
+<<<<<<< Updated upstream
     with(|r| !r.local.is_empty()) || fabric::pending() || console::input_pending()
+=======
+    with(|r| !r.local.is_empty()) || fabric::pending() || console::input_pending() || crate::virtio_blk::pending()
+>>>>>>> Stashed changes
 }
 
 // not while a job is ready: jobs never preempt the executor
@@ -928,6 +1128,7 @@ pub fn executor() -> ! {
     loop {
         let now = task::ticks();
         let handled = pump();
+        crate::virtio_blk::reap();
         task::reap_finished();
         expire(now);
         heartbeat(now);

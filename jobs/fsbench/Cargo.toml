@@ -1,0 +1,11 @@
+[package]
+name = "job-fsbench"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "job-fsbench"
+path = "src/main.rs"
+
+[dependencies]
+sydon-rt = { path = "../../rt" }

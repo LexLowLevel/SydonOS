@@ -49,6 +49,8 @@ struct Task {
     wake_at: u64,
     kill: bool,
     boost: bool,
+    // the job's vector registers while another job has them, null for kernel tasks
+    simd: *mut u8,
 }
 
 fn dummy(_: u64) {}
@@ -61,6 +63,7 @@ const TASK_EMPTY: Task = Task {
     state: AtomicU8::new(State::Empty as u8),
     system: false,
     cr3: 0,
+    simd: ptr::null_mut(),
     wake_at: 0,
     kill: false,
     boost: false,
@@ -71,6 +74,7 @@ static IDLE_RSP: AtomicU64 = AtomicU64::new(0);
 static CURRENT: AtomicUsize = AtomicUsize::new(IDLE);
 static TICKS: AtomicU64 = AtomicU64::new(0);
 static KERNEL_CR3: AtomicU64 = AtomicU64::new(0);
+static SIMD_OWNER: AtomicUsize = AtomicUsize::new(IDLE);
 
 extern "C" {
     static __stack_top: u8;
@@ -100,6 +104,25 @@ extern "C" {
     fn task_switch(old: *mut u64, new: u64);
 }
 
+fn index_of(t: *mut Task) -> usize {
+    (t as usize - ptr::addr_of!(TABLE) as usize) / core::mem::size_of::<Task>()
+}
+
+// a job's vector registers stay loaded until another job runs, so switching
+// to a kernel task and back costs nothing
+unsafe fn switch_simd(n: usize) {
+    let area = (*task_at(n)).simd;
+    let owner = SIMD_OWNER.load(Ordering::Relaxed);
+    if area.is_null() || owner == n {
+        return;
+    }
+    if owner != IDLE && !(*task_at(owner)).simd.is_null() {
+        crate::simd::save((*task_at(owner)).simd);
+    }
+    crate::simd::restore(area);
+    SIMD_OWNER.store(n, Ordering::Relaxed);
+}
+
 unsafe fn task_at(i: usize) -> *mut Task {
     (ptr::addr_of_mut!(TABLE) as *mut Task).add(i)
 }
@@ -127,6 +150,13 @@ extern "C" fn task_root() {
 // a task cannot free the stack it runs on, so this happens later
 unsafe fn reap(t: *mut Task) {
     free_stack((*t).stack as u64);
+    if !(*t).simd.is_null() {
+        if SIMD_OWNER.load(Ordering::Relaxed) == index_of(t) {
+            SIMD_OWNER.store(IDLE, Ordering::Relaxed);
+        }
+        crate::simd::free_area((*t).simd);
+        (*t).simd = ptr::null_mut();
+    }
     let kernel = KERNEL_CR3.load(Ordering::Relaxed);
     if (*t).cr3 != kernel {
         // a kernel task may still run on this space
@@ -152,9 +182,22 @@ pub fn spawn_in(entry: Entry, arg: u64, system: bool, cr3: u64) -> Option<usize>
         cpu::pop_flags(flags);
         return None;
     };
+    let simd = if cr3 == KERNEL_CR3.load(Ordering::Relaxed) {
+        ptr::null_mut()
+    } else {
+        match crate::simd::new_area() {
+            Some(p) => p,
+            None => {
+                free_stack(stack);
+                cpu::pop_flags(flags);
+                return None;
+            }
+        }
+    };
     let stack = stack as *mut u8;
     unsafe {
         let t = task_at(i);
+        (*t).simd = simd;
         // fake a task_switch frame: six zeroed registers, then task_root to ret into
         let rsp = stack as u64 + STACK_SIZE as u64 - 64;
         let p = rsp as *mut u64;
@@ -378,6 +421,9 @@ pub fn schedule() {
         cpu::write_cr3(cr3);
     }
     CURRENT.store(target, Ordering::Relaxed);
+    if let Some(n) = next {
+        unsafe { switch_simd(n) };
+    }
 
     let new_rsp: u64 = match next {
         Some(n) => unsafe { (*task_at(n)).rsp },

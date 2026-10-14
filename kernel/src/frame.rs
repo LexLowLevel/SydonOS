@@ -105,6 +105,8 @@ pub fn init(bi: &BootInfo) {
     }
 }
 
+// whether the e820 map calls this range usable ram
+
 pub fn init_region(base: u64, frames: u64) {
     let mut f = FRAMES.lock();
     f.insert(base, frames);

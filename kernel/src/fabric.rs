@@ -3,7 +3,7 @@ use crate::paging::phys_to_virt;
 use crate::sync::IrqCell;
 use crate::{apic, cpu, frame, task};
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{fence, AtomicU64, Ordering};
 
 pub const SLOTS: u64 = 64;
 pub const DOORBELL_VEC: u8 = 0x40;
@@ -33,10 +33,42 @@ struct Taken {
     count: AtomicU64,
 }
 
+// awake: nobody needs to ring. asleep: the core may be halted or running a
+// job, so it takes an interrupt. watching: the core waits in mwait on this
+// line, and the swap that clears it is all the wakeup it needs.
+const AWAKE: u64 = 0;
+const ASLEEP: u64 = 1;
+const WATCHING: u64 = 2;
+
 #[repr(C, align(64))]
 struct Door {
     asleep: AtomicU64,
     apic_id: AtomicU64,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Poll {
+    // never sleeps, so no wakeup is ever paid for
+    Always,
+    // polls a while after the last message, then sleeps
+    Adaptive,
+    // sleeps as soon as there is nothing to do
+    Never,
+}
+
+static POLICY: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(Poll::Adaptive as u8);
+static MWAIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn set_policy(p: Poll) {
+    POLICY.store(p as u8, Ordering::Relaxed);
+}
+
+pub fn policy() -> Poll {
+    match POLICY.load(Ordering::Relaxed) {
+        0 => Poll::Always,
+        2 => Poll::Never,
+        _ => Poll::Adaptive,
+    }
 }
 
 pub struct RingTx {
@@ -210,7 +242,7 @@ impl Fabric {
         None
     }
 
-    // pairs with the fence in prepare_halt(): either we see the receiver asleep,
+    // pairs with the fence in stop_polling(): either we see the receiver asleep,
     // or it sees our slot before it halts. without both fences x86 may
     // let each side read before its own store lands, and the wakeup is lost.
     // one fence covers all slots written before it.
@@ -221,7 +253,8 @@ impl Fabric {
         cpu::full_fence();
         for dst in (0..self.arena.cores).filter(|&d| mask & (1 << d) != 0) {
             let door = self.arena.door(dst);
-            if door.asleep.load(Ordering::Relaxed) != 0 && door.asleep.swap(0, Ordering::Relaxed) != 0 {
+            if door.asleep.load(Ordering::Relaxed) != AWAKE && door.asleep.swap(AWAKE, Ordering::Relaxed) == ASLEEP {
+                crate::stats::add(&crate::stats::DOORBELLS_SENT, 1);
                 apic::send_fixed(door.apic_id.load(Ordering::Relaxed) as u8, DOORBELL_VEC);
             }
         }
@@ -235,6 +268,7 @@ fn with<R>(f: impl FnOnce(&mut Fabric) -> R) -> Option<R> {
 }
 
 pub fn init(arena: Arena, me: usize) {
+    MWAIT.store(cpu::has_mwait(), Ordering::Relaxed);
     let mut fabric = Fabric {
         arena,
         me,
@@ -250,6 +284,53 @@ pub fn init(arena: Arena, me: usize) {
     FABRIC.with(|fab| *fab = Some(fabric));
 }
 
+// stops using the rings to and from `peer`. they are cleared before it is
+// connected again, so both ends start over at message 0.
+pub fn disconnect(peer: usize) {
+    with(|f| {
+        f.tx[peer] = None;
+        f.rx[peer] = None;
+    });
+}
+
+pub fn connect(peer: usize) {
+    with(|f| {
+        if peer != f.me && peer < f.arena.cores {
+            f.tx[peer] = Some(RingTx::new(f.arena.ring(f.me, peer), f.arena.slots));
+            f.rx[peer] = Some(RingRx::new(f.arena.ring(peer, f.me), f.arena.slots));
+        }
+    });
+}
+
+// only once every other core has disconnected from `core`
+pub fn clear_rings(core: usize) {
+    with(|f| {
+        let a = f.arena;
+        let bytes = a.ring_bytes() as usize;
+        for peer in (0..a.cores).filter(|&p| p != core) {
+            unsafe {
+                core::ptr::write_bytes(a.ring(core, peer) as *mut u8, 0, bytes);
+                core::ptr::write_bytes(a.ring(peer, core) as *mut u8, 0, bytes);
+            }
+        }
+        a.door(core).asleep.store(0, Ordering::Relaxed);
+        a.beat(core).count.store(0, Ordering::Relaxed);
+        a.beat(core).free_kib.store(0, Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+    });
+}
+
+pub const DEAD: u64 = u64::MAX;
+
+// a dying kernel says so on its beat line, which needs no working rpc
+pub fn mark_dead() {
+    with(|f| f.arena.beat(f.me).count.store(DEAD, Ordering::Release));
+}
+
+pub fn apic_id(core: usize) -> u8 {
+    with(|f| f.arena.door(core).apic_id.load(Ordering::Relaxed) as u8).unwrap_or(0)
+}
+
 pub fn cores() -> usize {
     with(|f| f.arena.cores).unwrap_or(1)
 }
@@ -258,7 +339,7 @@ pub fn beat(free_kib: u64) {
     with(|f| {
         let b = f.arena.beat(f.me);
         b.free_kib.store(free_kib, Ordering::Relaxed);
-        b.count.store(b.count.load(Ordering::Relaxed) + 1, Ordering::Release);
+        b.count.store((b.count.load(Ordering::Relaxed) + 1) % DEAD, Ordering::Release);
     });
 }
 
@@ -325,6 +406,7 @@ pub fn poll_many(out: &mut [(usize, Msg)]) -> usize {
             }
             empty = if took == 0 { empty + 1 } else { 0 };
         }
+        crate::stats::add(&crate::stats::MSGS_IN, got as u64);
         got
     })
     .unwrap_or(0)
@@ -402,7 +484,7 @@ pub fn idle_poll(ns: u64) -> bool {
     if !start_polling() {
         return false;
     }
-    let until = crate::clock::now_ns() + ns;
+    let until = crate::clock::now_ns().saturating_add(ns);
     while crate::clock::now_ns() < until && !task::others_ready() {
         if with(|f| kick(f)).unwrap_or(false) {
             return true;
@@ -429,11 +511,38 @@ pub fn stop_polling() -> bool {
 }
 
 pub fn on_doorbell() {
+    crate::stats::add(&crate::stats::DOORBELLS_TAKEN, 1);
     with(|f| {
         if let Some(t) = f.waiter {
             task::wake(t);
         }
     });
+}
+
+// instead of halting, waits on the door line with interrupts on. a sender
+// clearing the door wakes it without an interrupt. call with interrupts off,
+// after stop_polling said the core may sleep. false if the cpu cannot.
+pub fn watch() -> bool {
+    if !MWAIT.load(Ordering::Relaxed) {
+        return false;
+    }
+    let Some(door) = with(|f| f.arena.door(f.me) as *const Door) else {
+        return false;
+    };
+    let door = unsafe { &*door };
+    if door.asleep.compare_exchange(ASLEEP, WATCHING, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return true;
+    }
+    cpu::monitor(door as *const Door as *const u8);
+    // a message or a ring that came before the monitor was armed is seen here
+    cpu::full_fence();
+    if door.asleep.load(Ordering::Relaxed) == WATCHING && !pending() && !task::others_ready() {
+        cpu::sti_mwait();
+        cpu::cli();
+    }
+    let _ = door.asleep.compare_exchange(WATCHING, ASLEEP, Ordering::Relaxed, Ordering::Relaxed);
+    with(|f| kick(f));
+    true
 }
 
 // safety net: a missed doorbell costs at most one timer tick

@@ -6,6 +6,11 @@ pub const KERNEL_OFFSET: u64 = 0xFFFF_FFFF_8000_0000;
 pub const PHYSMAP: u64 = 0xFFFF_8000_0000_0000;
 pub const LAPIC_VIRT: u64 = 0xFFFF_FFFF_4000_0000;
 pub const IOAPIC_VIRT: u64 = LAPIC_VIRT + 0x1000;
+<<<<<<< Updated upstream
+=======
+const MMIO_VIRT: u64 = LAPIC_VIRT + 0x1000_0000;
+static MMIO_NEXT: AtomicU64 = AtomicU64::new(MMIO_VIRT);
+>>>>>>> Stashed changes
 const LAPIC_PHYS: u64 = 0xFEE0_0000;
 
 pub const HUGE: u64 = 0x20_0000;
@@ -160,6 +165,16 @@ pub fn init() -> u64 {
     pml4
 }
 
+pub fn map_mmio(phys: u64, len: u64) -> u64 {
+    let base = phys & !0xFFF;
+    let pages = (phys + len - base).div_ceil(0x1000);
+    let virt = MMIO_NEXT.fetch_add(pages * 0x1000, Ordering::Relaxed);
+    for i in 0..pages {
+        unsafe { map_4k(current(), virt + i * 0x1000, base + i * 0x1000, WRITABLE | NO_CACHE) };
+    }
+    virt + (phys - base)
+}
+
 pub fn use_physmap() {
     PHYS_OFFSET.store(PHYSMAP, Ordering::Relaxed);
 }
@@ -199,6 +214,27 @@ fn leaf(pml4: u64, virt: u64) -> Option<u64> {
         }
         let e = entry(table, pti(virt)).read_volatile();
         (e & PRESENT != 0).then_some(e)
+    }
+}
+
+// the table frames of a whole space, not the pages they map
+pub fn free_tables(pml4: u64, free: impl Fn(u64) -> bool + Copy) {
+    unsafe fn walk(table: u64, level: u32, free: impl Fn(u64) -> bool + Copy) {
+        for i in 0..512 {
+            let e = entry(table, i).read_volatile();
+            if e & PRESENT == 0 || e & HUGE_PAGE != 0 || level == 1 {
+                continue;
+            }
+            let next = e & ADDR_MASK;
+            walk(next, level - 1, free);
+            if free(next) {
+                frame::free(next, 1);
+            }
+        }
+    }
+    unsafe { walk(pml4, 4, free) };
+    if free(pml4) {
+        frame::free(pml4, 1);
     }
 }
 

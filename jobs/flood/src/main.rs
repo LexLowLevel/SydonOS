@@ -5,6 +5,7 @@ use sydon_rt::rpc::{Error, Server, Service};
 use sydon_rt::{format, println, sys};
 
 sydon_rt::main!(main);
+sydon_rt::manifest!(needs: "echo");
 
 // echod never answers op 2
 const SILENT: u16 = 2;
@@ -13,7 +14,7 @@ fn main() -> u64 {
     let echo = match Service::lookup("echo") {
         Ok(s) => s,
         Err(e) => {
-            println!("flood: no echo service ({})", e);
+            println!("flood: no echo service ({}), try: spawn echod", e);
             return 1;
         }
     };

@@ -7,6 +7,13 @@ name = "freelist"
 version = "0.1.0"
 
 [[package]]
+name = "job-crunch"
+version = "0.1.0"
+dependencies = [
+ "sydon-rt",
+]
+
+[[package]]
 name = "job-echod"
 version = "0.1.0"
 dependencies = [
@@ -22,6 +29,34 @@ dependencies = [
 
 [[package]]
 name = "job-flood"
+version = "0.1.0"
+dependencies = [
+ "sydon-rt",
+]
+
+[[package]]
+name = "job-flops"
+version = "0.1.0"
+dependencies = [
+ "sydon-rt",
+]
+
+[[package]]
+name = "job-fsbench"
+version = "0.1.0"
+dependencies = [
+ "sydon-rt",
+]
+
+[[package]]
+name = "job-fsrand"
+version = "0.1.0"
+dependencies = [
+ "sydon-rt",
+]
+
+[[package]]
+name = "job-fswrite"
 version = "0.1.0"
 dependencies = [
  "sydon-rt",
@@ -64,6 +99,20 @@ dependencies = [
 
 [[package]]
 name = "job-ticker"
+version = "0.1.0"
+dependencies = [
+ "sydon-rt",
+]
+
+[[package]]
+name = "job-utils"
+version = "0.1.0"
+dependencies = [
+ "sydon-rt",
+]
+
+[[package]]
+name = "job-yielder"
 version = "0.1.0"
 dependencies = [
  "sydon-rt",

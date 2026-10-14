@@ -8,6 +8,7 @@ mod serial;
 mod acpi;
 mod apic;
 mod bootinfo;
+mod bufs;
 mod clock;
 mod console;
 mod cpu;
@@ -15,19 +16,26 @@ mod director;
 mod elf;
 mod fabric;
 mod frame;
+mod fs;
 mod gdt;
 mod heap;
 mod idt;
 mod ioapic;
 mod jobs;
 mod paging;
+mod pipe;
+mod pci;
+mod storage;
 mod pit;
 mod ringtest;
 mod rpc;
 mod smp;
+mod stats;
+mod simd;
 mod sync;
 mod task;
 mod user;
+mod virtio_blk;
 
 use bootinfo::BootInfo;
 use core::arch::global_asm;
@@ -51,16 +59,17 @@ extern "C" {
 
 #[no_mangle]
 extern "C" fn kernel_main(boot_info: *const BootInfo) -> ! {
+    let bi = unsafe { &*boot_info };
     serial::init();
     println!("sydonOS: kernel core up");
-
-    let bi = unsafe { &*boot_info };
     assert!(bi.magic == bootinfo::MAGIC, "bootinfo: bad magic");
     let (elf_phys, elf_size) = (bi.kernel_elf_addr, bi.kernel_elf_size as usize);
 
     gdt::init(core::ptr::addr_of!(__stack_top) as u64);
     idt::init();
     println!("gdt + tss + idt ready");
+    let (simd, simd_bytes) = simd::init();
+    println!("simd: xcr0 {:#x}, {} bytes saved per job", simd, simd_bytes);
 
     apic::mask_legacy_pic();
 
@@ -107,10 +116,19 @@ pub fn run_core() -> ! {
     cpu::sti();
     task::schedule();
     loop {
-        if !fabric::idle_poll(IDLE_POLL_NS) {
+        let policy = fabric::policy();
+        let polled = match policy {
+            fabric::Poll::Always => fabric::idle_poll(u64::MAX),
+            fabric::Poll::Adaptive => fabric::idle_poll(IDLE_POLL_NS),
+            fabric::Poll::Never => false,
+        };
+        if !polled && policy != fabric::Poll::Always {
             cpu::cli();
             if fabric::stop_polling() && !task::others_ready() {
-                cpu::sti_hlt();
+                stats::add(&stats::HALTS, 1);
+                if !fabric::watch() {
+                    cpu::sti_hlt();
+                }
             }
             cpu::sti();
         }
@@ -119,10 +137,20 @@ pub fn run_core() -> ! {
 }
 
 fn core_main(_: u64) {
-    ringtest::run();
+    // the self test needs every core at once, which a restart cannot give it
+    if !smp::restarted() {
+        ringtest::run();
+    }
+    if smp::core() == fabric::cores() - 1 {
+        storage::start();
+    }
     if smp::core() == 0 {
         director::init(fabric::cores());
+<<<<<<< Updated upstream
         if let Err(status) = director::spawn(b"shell", director::ANY_CORE, 0) {
+=======
+        if let Err(status) = director::spawn(b"shell", director::ANY_CORE, 0, None) {
+>>>>>>> Stashed changes
             println!("director: could not start the shell (status {})", status);
         }
     }
@@ -131,6 +159,9 @@ fn core_main(_: u64) {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    if smp::core() != 0 {
+        fabric::mark_dead();
+    }
     println!("cpu {}: kernel panic: {}", smp::core(), info);
     serial::flush();
     cpu::cli();

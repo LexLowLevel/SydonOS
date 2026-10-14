@@ -40,6 +40,15 @@ impl<T> SpinLock<T> {
     }
 }
 
+impl<T> SpinLock<T> {
+    // for a lock held by a core that is gone and will never unlock it
+    pub unsafe fn release_if(&self, dead: impl FnOnce(&T) -> bool) {
+        if self.locked.load(Ordering::Acquire) && dead(&*self.data.get()) {
+            self.locked.store(false, Ordering::Release);
+        }
+    }
+}
+
 impl<T> Deref for SpinGuard<'_, T> {
     type Target = T;
 

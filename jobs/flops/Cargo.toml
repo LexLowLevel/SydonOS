@@ -1,0 +1,11 @@
+[package]
+name = "job-flops"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "job-flops"
+path = "src/main.rs"
+
+[dependencies]
+sydon-rt = { path = "../../rt" }

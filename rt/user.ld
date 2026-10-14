@@ -2,9 +2,13 @@ ENTRY(_start)
 
 SECTIONS
 {
-    . = 0x400000;
+    . = 0x400000 + SIZEOF_HEADERS;
 
-    .text : {
+    .sydon_manifest : {
+        KEEP(*(.sydon_manifest))
+    }
+
+    .text : ALIGN(16) {
         *(.text._start)
         *(.text .text.*)
     }

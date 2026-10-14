@@ -5,15 +5,17 @@ use sydon_rt::rpc::{Error, Pending, Service};
 use sydon_rt::{println, sys, Vec};
 
 sydon_rt::main!(main);
+sydon_rt::manifest!(needs: "echo");
 
 const ROUNDS: u64 = 1000;
 const IN_FLIGHT: usize = 8;
+const IDLE_ROUNDS: u64 = 100;
 
 fn main() -> u64 {
     let echo = match Service::lookup("echo") {
         Ok(s) => s,
         Err(e) => {
-            println!("ping: no echo service ({})", e);
+            println!("ping: no echo service ({}), try: spawn echod", e);
             return 1;
         }
     };
@@ -47,6 +49,28 @@ fn main() -> u64 {
         micros(min),
         micros(total / ROUNDS),
         micros(max)
+    );
+
+    // long enough apart that the server's core has gone to sleep each time
+    let (mut min, mut total) = (u64::MAX, 0);
+    for _ in 0..IDLE_ROUNDS {
+        sys::sleep_ns(2_000_000);
+        let t0 = sys::time_ns();
+        if let Err(e) = echo.call(1, msg) {
+            println!("ping: {}", e);
+            return 1;
+        }
+        let dt = sys::time_ns() - t0;
+        min = min.min(dt);
+        total += dt;
+    }
+    println!(
+        "ping: {} calls after 2 ms idle cpu {} -> cpu {}: min {} us, avg {} us",
+        IDLE_ROUNDS,
+        me,
+        echo.core(),
+        micros(min),
+        micros(total / IDLE_ROUNDS)
     );
 
     let t0 = sys::time_ns();

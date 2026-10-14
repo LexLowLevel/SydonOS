@@ -58,6 +58,22 @@ pub fn sti_hlt() {
     }
 }
 
+pub fn has_mwait() -> bool {
+    cpuid(1, 0).2 & (1 << 3) != 0
+}
+
+#[inline]
+pub fn monitor(addr: *const u8) {
+    unsafe { asm!("monitor", in("rax") addr, in("ecx") 0, in("edx") 0, options(nostack, preserves_flags)) }
+}
+
+// like sti_hlt, but a write to the line armed with monitor wakes it too.
+// hint 0 is the shallowest sleep, the fastest to leave.
+#[inline]
+pub fn sti_mwait() {
+    unsafe { asm!("sti", "mwait", in("eax") 0, in("ecx") 0, options(nostack, preserves_flags)) }
+}
+
 #[inline]
 pub fn sti() {
     unsafe {
@@ -88,6 +104,46 @@ pub fn pop_flags(flags: u64) {
 #[inline(always)]
 pub fn full_fence() {
     unsafe { asm!("lock or qword ptr [rsp], 0") }
+}
+
+pub fn cpuid(leaf: u32, sub: u32) -> (u32, u32, u32, u32) {
+    let r = unsafe { core::arch::x86_64::__cpuid_count(leaf, sub) };
+    (r.eax, r.ebx, r.ecx, r.edx)
+}
+
+// logical cpus sharing the L3: leaf 4 on intel, 0x8000001d on amd
+pub fn l3_sharing() -> u32 {
+    let max_ext = cpuid(0x8000_0000, 0).0;
+    for leaf in [4, 0x8000_001D] {
+        if leaf > 0x8000_0000 && max_ext < leaf {
+            continue;
+        }
+        for sub in 0..8 {
+            let eax = cpuid(leaf, sub).0;
+            if eax & 0x1F == 0 {
+                break;
+            }
+            if (eax >> 5) & 7 == 3 {
+                return ((eax >> 14) & 0xFFF) + 1;
+            }
+        }
+    }
+    1
+}
+
+// low apic id bits that number the threads of one core
+pub fn smt_shift() -> u32 {
+    if cpuid(0, 0).0 >= 0xB {
+        let (eax, _, ecx, _) = cpuid(0xB, 0);
+        if (ecx >> 8) & 0xFF == 1 {
+            return eax & 0x1F;
+        }
+    }
+    if cpuid(0x8000_0000, 0).0 >= 0x8000_001E {
+        let threads = (cpuid(0x8000_001E, 0).1 >> 8) & 0xFF;
+        return (threads + 1).next_power_of_two().trailing_zeros();
+    }
+    0
 }
 
 #[inline]
@@ -158,5 +214,3 @@ pub unsafe fn lidt(desc: &DescriptorTablePointer) {
 pub unsafe fn ltr(sel: u16) {
     asm!("ltr {0:x}", in(reg) sel, options(nostack, preserves_flags));
 }
-
-

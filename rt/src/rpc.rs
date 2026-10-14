@@ -11,6 +11,9 @@ pub enum Error {
     Down,
     NoMemory,
     Busy,
+    Closed,
+    NotEmpty,
+    Full,
     Other(u64),
 }
 
@@ -25,6 +28,9 @@ impl Error {
             6 => Error::Down,
             7 => Error::NoMemory,
             8 => Error::Busy,
+            9 => Error::Closed,
+            10 => Error::NotEmpty,
+            11 => Error::Full,
             s => Error::Other(s),
         }
     }
@@ -39,6 +45,9 @@ impl Error {
             Error::Down => 6,
             Error::NoMemory => 7,
             Error::Busy => 8,
+            Error::Closed => 9,
+            Error::NotEmpty => 10,
+            Error::Full => 11,
             Error::Other(s) => s as u8,
         }
     }
@@ -55,6 +64,9 @@ impl fmt::Display for Error {
             Error::Down => write!(f, "core is down"),
             Error::NoMemory => write!(f, "out of memory"),
             Error::Busy => write!(f, "no room for another job on that core"),
+            Error::Closed => write!(f, "closed"),
+            Error::NotEmpty => write!(f, "directory not empty"),
+            Error::Full => write!(f, "no space left on the disk"),
             Error::Other(s) => write!(f, "status {}", s),
         }
     }
@@ -132,12 +144,25 @@ impl Service {
         handle_or_err(sys::submit(self.0, op, data, timeout_ns)).map(Pending)
     }
 
+    pub fn submit_buf(&self, op: u16, body: &[u8], data: &[u8]) -> Result<Pending, Error> {
+        handle_or_err(sys::submit_buf(self.0, op, body, data)).map(Pending)
+    }
+
     pub fn call(&self, op: u16, data: &[u8]) -> Result<Payload, Error> {
-        self.submit(op, data)?.wait()
+        self.call_timeout(op, data, 0)
     }
 
     pub fn call_forever(&self, op: u16, data: &[u8]) -> Result<Payload, Error> {
-        self.submit_timeout(op, data, sys::FOREVER)?.wait()
+        self.call_timeout(op, data, sys::FOREVER)
+    }
+
+    pub fn call_timeout(&self, op: u16, data: &[u8], timeout_ns: u64) -> Result<Payload, Error> {
+        let mut out = [0u8; PAYLOAD];
+        let v = sys::call_rpc(self.0, op, data, timeout_ns, &mut out);
+        match sys::status_of(v) {
+            Some(s) if v != sys::BAD_ID => Err(Error::from_status(s)),
+            _ => finish(v, out),
+        }
     }
 }
 
@@ -185,10 +210,28 @@ impl Server {
     pub fn recv(&self) -> Result<Request, Error> {
         let mut out = [0u8; PAYLOAD];
         let (token, meta) = sys::recv(self.0, &mut out);
-        let token = handle_or_err(token)?;
-        let len = (meta as u32 as usize).min(PAYLOAD);
-        Ok(Request { token, op: (meta >> 32) as u16, payload: Payload { data: out, len } })
+        request(token, meta, out)
     }
+
+    pub fn reply_recv(&self, req: Request, data: &[u8]) -> Result<Request, Error> {
+        self.answer_recv(req.token, 0, data)
+    }
+
+    pub fn fail_recv(&self, req: Request, e: Error) -> Result<Request, Error> {
+        self.answer_recv(req.token, e.status(), &[])
+    }
+
+    fn answer_recv(&self, token: u64, status: u8, data: &[u8]) -> Result<Request, Error> {
+        let mut out = [0u8; PAYLOAD];
+        let (token, meta) = sys::reply_recv(self.0, token, status, data, &mut out);
+        request(token, meta, out)
+    }
+}
+
+fn request(token: u64, meta: u64, out: [u8; PAYLOAD]) -> Result<Request, Error> {
+    let token = handle_or_err(token)?;
+    let len = (meta as u32 as usize).min(PAYLOAD);
+    Ok(Request { token, op: (meta >> 32) as u16, payload: Payload { data: out, len } })
 }
 
 impl Request {
